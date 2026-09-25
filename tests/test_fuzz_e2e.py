@@ -24,10 +24,16 @@ from veridict.keys import KeyStore
 from veridict.ladder import adjudicate
 from veridict.ledger import Ledger
 from veridict.policy import PolicyDeclaration, Thresholds
-from veridict.schemas import ActorRef, EVIDENCE_CLASSES, EvidenceItem, TaskManifest
+from veridict.schemas import (ActorRef, EVIDENCE_CLASSES, EvidenceItem,
+                             STANCES, TaskManifest)
 from veridict.utils import sha256_hex
 
-STANCES = ("SUPPORTS", "REFUTES", "ABSTAIN")
+# EvidenceItem now validates stance/tier at the boundary (audit F1/F2/F9: an
+# unregistered tier was invisible to the ladder and flipped verdicts; an
+# unregistered stance was either a silent verify or a phantom dissent). The
+# fuzzer exercises what the schema accepts; the rejection path is covered
+# directly by tests/test_schema_rejects_unknown_tier_and_stance.
+STANCES = STANCES
 TIERS = ("W1b", "W2", "W3")
 KINDS = ("verifier", "jury", "watcher", "adjudicator")
 
@@ -94,6 +100,10 @@ def test_random_audits_verify_cross_implementation(tmp_path):
                                 version=item.producer["version"]),
                        item.to_dict())
         adj = adjudicate(claim, items, pol)
+        # D19: verifier reconciles policy_ref against the ledger's recorded policy
+        __import__("veridict.policy", fromlist=["PolicyEngine"]).PolicyEngine(
+            led).apply([claim], {claim.claim_id: items}, pol,
+                       ActorRef(kind="system", identity="fuzz", version="1"))
         cert = __import__("veridict.certificate", fromlist=["CertificateIssuer"]) \
             .CertificateIssuer(led, ks, kid).issue(
                 task=task, artifact_digest=f"art-{i}", policy=pol,

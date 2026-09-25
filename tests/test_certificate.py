@@ -4,10 +4,11 @@ from veridict.certificate import CertificateIssuer, verify_certificate
 from veridict.claim_extractor import ClaimExtractor
 from veridict.keys import SYSTEM_AUTHOR, KeyStore
 from veridict.ladder import adjudicate
+from veridict.schemas import ActorRef, EvidenceItem, SCHEMA_VERSION
 from veridict.ledger import Ledger
-from veridict.policy import PolicyDeclaration, Thresholds
+from veridict.policy import PolicyDeclaration, PolicyEngine, Thresholds
 from veridict.schemas import TaskManifest
-from veridict.utils import canonical_json
+from veridict.utils import canonical_json, payload_digest, sha256_hex
 
 
 def _fixture(tmp_path, code, test):
@@ -31,6 +32,13 @@ def _run(tmp_path):
         led.append("claim.registered", SYSTEM_AUTHOR, c.to_dict())
     ev = {c.claim_id: [] for c in claims}          # unit fixture: no evidence recorded
     adjs = [adjudicate(c, ev[c.claim_id], pol) for c in claims]
+    # D19: the verifier reconciles the cert's policy against the policy the
+    # ledger records the run used. The helper records one, so verification
+    # exercises the check instead of failing on an unattested policy.
+    from veridict.policy import PolicyEngine
+    PolicyEngine(led).apply(
+        claims, ev, pol, ActorRef(kind="system", identity="veridict-core",
+                                  version=SCHEMA_VERSION))
     cert = CertificateIssuer(led, ks, kid).issue(
         task=task, artifact_digest="digest", policy=pol, claims=claims,
         adjudications=adjs, evidence_by_claim=ev, jury_families=["stub-a", "stub-b"],
@@ -133,3 +141,277 @@ def test_verify_rejects_unknown_evidence_reference(tmp_path):
     assert report["valid"] is False, report
     assert any("unknown evidence" in e for e in report["errors"]), report["errors"]
     assert report["signature_valid"] is True    # isolate: signature fine, reference missing
+
+
+def test_forged_risk_level_is_caught(tmp_path):
+    """Tamga ERRATUM-A2 class: a summary field that follows from the verdicts
+    must not be independently forgeable.
+
+    The verdicts are recomputed, so they cannot be lied about. But a verifier
+    that stops at the verdicts leaves risk_level free — an attacker rewrites
+    it to 'low' while a claim verdict says REFUTED, or to 'high' while they
+    say VERIFIED. A consumer that reads risk_level to decide (the settlement
+    policy gates on exactly this field) would then decide on a forged value.
+    The verifier must recompute it from the same verdicts it just checked.
+    """
+    from veridict.audit import AuditOrchestrator
+    from veridict.jury import Jury, ScriptedProvider, Opinion
+    from veridict.keys import KeyStore
+    from veridict.ledger import Ledger
+    from veridict.policy import PolicyDeclaration, PolicyEngine, Thresholds
+    from veridict.schemas import TaskManifest
+    import os, json, copy
+    pkg = tmp_path / "pkg"; pkg.mkdir()
+    (pkg / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    (pkg / "test_calc.py").write_text(
+        "def test_add():\n    from calc import add\n    assert add(1, 2) == 3\n")
+    led = Ledger(); ks = KeyStore(led); kid = ks.generate_and_enroll("t")
+    jury = Jury([ScriptedProvider(family="a", identity="a-1",
+                                  default=Opinion("SUPPORTS", 0.8, "ok")),
+                 ScriptedProvider(family="b", identity="b-1",
+                                  default=Opinion("SUPPORTS", 0.8, "ok"))])
+    pol = PolicyDeclaration(policy_id="t", mode="CERTIFICATE", criticality=(),
+                            thresholds=Thresholds(), divergence_tolerance=1 / 3)
+    task = TaskManifest(task_id="t", artifact_path=str(pkg), actor_identity="a",
+                        intent_lines=("MACHINE: add computes the sum",),
+                        criticality=(), has_existing_tests=True, pytest_args=[])
+    out = AuditOrchestrator(led, pol, jury, ks, kid).run(task, "REDACTED")
+    led.save(str(tmp_path / "ledger.jsonl"))
+    cp = tmp_path / "cert.json"
+    cp.write_text(json.dumps(out["cert"], indent=2, sort_keys=True))
+    base = json.loads(cp.read_text())
+
+    # baseline: the honest certificate verifies
+    assert verify_certificate(str(tmp_path / "ledger.jsonl"), str(cp))["valid"]
+
+    def probe(mutate):
+        c = copy.deepcopy(base)
+        mutate(c)
+        cp.write_text(json.dumps(c, indent=2, sort_keys=True))
+        return verify_certificate(str(tmp_path / "ledger.jsonl"), str(cp))
+
+    # inflated risk: verdicts are all VERIFIED but risk says high
+    r = probe(lambda c: c.__setitem__("risk_level", "high"))
+    assert not r["valid"], "inflated risk_level must not verify"
+    assert any("risk_level mismatch" in e for e in r["errors"])
+
+    # deflated score
+    r = probe(lambda c: c.__setitem__("score", 0.0))
+    assert not r["valid"], "forged score must not verify"
+    assert any("score mismatch" in e for e in r["errors"])
+
+    # D18: divergence_summary is the second member of the same class — a
+    # per-claim summary that follows from the same adjudications. Forging it
+    # to UNANIMOUS presents a contested finding as settled, which is the
+    # framing direction of A2-prime. (The honest certificate here is all
+    # UNANIMOUS, so forge in the other direction: claim a SPLIT that did
+    # not happen.)
+    if base.get("divergence_summary"):
+        r = probe(lambda c: c.__setitem__(
+            "divergence_summary",
+            {k: "SPLIT" for k in c["divergence_summary"]}))
+        assert not r["valid"], "forged divergence_summary must not verify"
+
+    # restore, then hide a bad result: flip a verdict to REFUTED and keep
+    # risk_level 'low'. This is the dangerous direction — the verdict itself
+    # is now inconsistent with the ledger, so the verdict check fires; the
+    # risk check is defense in depth, not the only guard.
+    cp.write_text(json.dumps(base, indent=2, sort_keys=True))
+    r = probe(lambda c: (c["claims"].__setitem__(
+        0, {**c["claims"][0], "verdict_value": "REFUTED"}),
+        c.__setitem__("risk_level", "low")))
+    assert not r["valid"], "a hidden REFUTED verdict must not verify"
+
+
+def test_policy_provenance_is_reconciled_not_trusted(tmp_path):
+    """D19: policy_ref is an INPUT to the verdicts, not a consequence.
+
+    Unlike risk_level (D17) or divergence_summary (D18) which follow from
+    the verdicts, the cert's policy_ref is used to BUILD the replay policy.
+    A verifier reading it from the certificate replays under whatever
+    policy the issuer claims to have used — which is a forgeable claim
+    about a thing that changes verdicts, not just summaries.
+
+    Three scenarios, and the third is the one the first fix attempt got
+    wrong: a policy_id the ledger never records is unfalsifiable, and the
+    original check skipped itself when no match existed — fail-open by
+    construction.
+    """
+    cert, ledger_path, cert_path = _run(tmp_path)
+    assert verify_certificate(ledger_path, cert_path)["valid"]
+
+    def probe(mutate):
+        # each probe mutates its own copy — an earlier probe must not
+        # poison the file the later ones read
+        import copy as _copy
+        c = _copy.deepcopy(cert)
+        mutate(c)
+        with open(cert_path, "w") as f:
+            json.dump(c, f, indent=2, sort_keys=True)
+        return verify_certificate(ledger_path, cert_path)
+
+    # (1) claim a policy the ledger never recorded — must fail closed,
+    # not skip the check
+    r = probe(lambda c: c.__setitem__(
+        "policy_ref", {**c["policy_ref"], "policy_id": "never-ran"}))
+    assert not r["valid"]
+    assert any("unattested policy" in e for e in r["errors"])
+
+    # (2) policy_mode disagrees with policy_ref.mode — duplicated value
+    r = probe(lambda c: c.__setitem__("policy_mode", "GATE"))
+    assert not r["valid"]
+    assert any("policy_mode mismatch" in e for e in r["errors"])
+
+    # (3) a real policy_id with forged contents — the replay policy built
+    # from the cert would differ from the recorded policy_digest
+    r = probe(lambda c: c.__setitem__(
+        "policy_ref", {**c["policy_ref"],
+                       "criticality": ["existing-test-suite-passes"]}))
+    assert not r["valid"]
+    assert any("policy mismatch" in e for e in r["errors"])
+
+
+def test_post_issuance_policy_decision_cannot_attest_or_poison(tmp_path):
+    """Scope guard on the D19 reconciliation.
+
+    The reconciliation reads policy.decision entries, but only ones INSIDE
+    the anchored prefix (seq <= checkpoint_seq) may attest the policy a run
+    used. The cert's signed anchor pins the prefix chain_hash, so an entry
+    appended after issuance is outside the pinned prefix. Two exploits the
+    guard closes:
+
+      (a) an attacker appends a policy.decision naming the cert's policy_id
+          to make an unattested cert verify (retroactive attestation);
+      (b) an attacker appends a MISMATCHED policy.decision for the same
+          policy_id to engineer a spurious rejection of a good cert.
+
+    Both must be invisible to the verifier, which sees only the in-prefix
+    state the anchor pins.
+    """
+    cert, ledger_path, cert_path = _run(tmp_path)
+    assert verify_certificate(ledger_path, cert_path)["valid"]
+    cp_seq = cert["ledger_anchor"]["checkpoint_seq"]
+
+    led = Ledger.load(ledger_path)
+    pol = PolicyDeclaration(policy_id="p1", mode="CERTIFICATE",
+                            criticality=(), thresholds=Thresholds(),
+                            divergence_tolerance=1 / 3)
+    # (a) appended AFTER the checkpoint — outside the anchored prefix
+    led.append("policy.decision",
+               ActorRef(kind="system", identity="attacker", version="1"), {
+                   "decision_kind": "policy.passed", "policy_id": "p1",
+                   "policy_digest": payload_digest(pol.to_dict()),
+                   "mode": "CERTIFICATE"})
+    p = str(tmp_path / "poisoned.jsonl")
+    led.save(p)
+
+    r = verify_certificate(p, cert_path)
+    # the appended entry is outside the anchored prefix, so it must not
+    # change the verdict at all — neither rescue nor reject
+    assert r["valid"], "post-issuance attestation must not change a verdict"
+
+    # (b) same trick with a WRONG digest must not manufacture a rejection of
+    # a cert that was honest when issued
+    forged = PolicyDeclaration(policy_id="p1", mode="CERTIFICATE",
+                               criticality=("never-ran-critical",),
+                               thresholds=Thresholds(), divergence_tolerance=1 / 3)
+    led2 = Ledger.load(ledger_path)
+    led2.append("policy.decision",
+                ActorRef(kind="system", identity="attacker", version="1"), {
+                    "decision_kind": "policy.passed", "policy_id": "p1",
+                    "policy_digest": payload_digest(forged.to_dict()),
+                    "mode": "CERTIFICATE"})
+    p2 = str(tmp_path / "poisoned2.jsonl")
+    led2.save(p2)
+    assert cp_seq == cert["ledger_anchor"]["checkpoint_seq"]
+    assert verify_certificate(p2, cert_path)["valid"], \
+        "post-issuance mismatch must not poison an honest cert"
+
+
+def _run_inconclusive(tmp_path):
+    """Helper for D20: a cert whose claim is INCONCLUSIVE (no evidence).
+
+    This is the vulnerable shape — a post-checkpoint W1a SUPPORTS item
+    would flip the replay to VERIFIED without the scope guard.
+    """
+    led = Ledger()
+    ks = KeyStore(led)
+    kid = ks.generate_and_enroll("issuer")
+    task = TaskManifest(task_id="d20", artifact_path="/x", actor_identity="dev",
+                        intent_lines=("MACHINE: add computes the sum of two numbers",),
+                        criticality=(), has_existing_tests=True, pytest_args=())
+    claim = ClaimExtractor().extract(task, "d-d20")[0]
+    led.append("claim.registered", ActorRef(kind="system", identity="c", version="1"),
+               claim.to_dict())
+    pol = PolicyDeclaration(policy_id="d20pol", mode="CERTIFICATE",
+                            criticality=(), thresholds=Thresholds(),
+                            divergence_tolerance=1 / 3)
+    PolicyEngine(led).apply([claim], {}, pol,
+                           ActorRef(kind="system", identity="c", version="1"))
+    adj = adjudicate(claim, [], pol)
+    assert adj.value == "INCONCLUSIVE"
+    cert = CertificateIssuer(led, ks, kid).issue(
+        task=task, artifact_digest="d20", policy=pol, claims=[claim],
+        adjudications=[adj], evidence_by_claim={},
+        jury_families=["f1", "f2"], disclosure_level="REDACTED",
+        scope_limits=["claim coverage is heuristic, not exhaustive"])
+    lp, cp = str(tmp_path / "led.jsonl"), str(tmp_path / "cert.json")
+    led.save(lp)
+    json.dump(cert, open(cp, "w"), indent=2, sort_keys=True)
+    return cert, lp, cp, ks, kid
+
+
+def test_post_issuance_evidence_cannot_flip_a_verdict(tmp_path):
+    """D20: replay scope is the anchored prefix, not the whole ledger.
+
+    The replay reads evidence.recorded and claim.registered. Both were
+    unscoped until D20 — the claim dict comprehension also OVERWRITES an
+    earlier claim when a claim_id repeats. An attacker with ledger write
+    access appends a W1a SUPPORTS item after the checkpoint; the ladder
+    gives W1a absolute priority, so an INCONCLUSIVE claim becomes
+    VERIFIED and the certificate stops matching its own replay
+    (detection) — or, worse, with a cooperating issuer the forged
+    verdict is what the cert claims (silent acceptance). The guard makes
+    the post-issuance entry invisible, so the replay sees exactly the
+    in-prefix state the anchor pins.
+    """
+    cert, ledger_path, cert_path, ks, kid = _run_inconclusive(tmp_path)
+    assert verify_certificate(ledger_path, cert_path)["valid"]
+
+    led = Ledger.load(ledger_path)
+    cp_seq = cert["ledger_anchor"]["checkpoint_seq"]
+    cid = cert["claims"][0]["claim_id"]
+    attack = EvidenceItem(
+        evidence_id="veridict-evidence-v1-" + sha256_hex("d20-atk")[:24],
+        claim_id=cid, evidence_class="TEST_EXECUTION", tier="W1a",
+        producer={"kind": "verifier", "identity": "atk", "version": "1",
+                  "family": "f1"},
+        artifact_ref="d20",
+        reproducibility={"deterministic": True, "rerun_recipe": {"cmd": ["true"]}},
+        stance="SUPPORTS", confidence=1.0, rationale="attacker pass")
+    led.append("evidence.recorded",
+               ActorRef(kind="verifier", identity="atk", version="1"), attack.to_dict())
+    poisoned = str(tmp_path / "poisoned.jsonl")
+    led.save(poisoned)
+    assert led.entries[-1]["seq"] > cp_seq, "test premise: entry is post-checkpoint"
+
+    r = verify_certificate(poisoned, cert_path)
+    assert r["valid"], "guard must keep an honest cert valid under injection"
+    assert r["verdicts_match"], "the injected evidence must not reach the replay"
+
+    # same injection must also not let a FORGED cert through: craft a cert
+    # whose verdict says VERIFIED, matching what the unguarded replay yields,
+    # and re-sign it properly so only the replay scope can catch it
+    forged = json.loads(open(cert_path).read())
+    forged["claims"][0]["verdict_value"] = "VERIFIED"
+    body = dict(forged)
+    body.pop("signatures", [])
+    forged["signatures"] = [{
+        "key_id": kid, "algorithm": "ed25519",
+        "sig_b64": ks.sign(kid, canonical_json(body).encode("utf-8"))}]
+    fp = str(tmp_path / "forged.json")
+    json.dump(forged, open(fp, "w"), indent=2, sort_keys=True)
+    rf = verify_certificate(poisoned, fp)
+    assert not rf["valid"], "forged VERIFIED verdict must not verify"
+    assert any("verdict mismatch" in e for e in rf["errors"]), \
+        "rejection must come from the replay, not a side channel"

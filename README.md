@@ -5,7 +5,7 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.12%2B-blue.svg)](pyproject.toml)
 [![Standard](https://img.shields.io/badge/standard-v1.0.0--draft-8A2BE2.svg)](docs/specs/2026-09-10-veridict-standard-v1.0.md)
-[![Veridict self-audit](https://raw.githubusercontent.com/goun7/veridict/main/docs/assets/veridict-badge.svg)](https://github.com/goun7/veridict/releases/download/v0.3.3/dogfood_cert.json)
+[![Veridict self-audit](https://raw.githubusercontent.com/goun7/veridict/main/docs/assets/veridict-badge.svg)](https://github.com/goun7/veridict/releases/download/v1.0.0/dogfood_cert.json)
 
 *The verdict that survived verification.* | **[Türkçe](README.tr.md)**
 
@@ -38,16 +38,17 @@ pip install veridict-standard
 # DIFFERENT project — not ours). Same package from the repo, if preferred:
 #   pip install -e . && pip install pytest
 
-# audit a task end-to-end (GATE mode) — see examples/ for runnable scenarios
-veridict --help
+# first run: who am I, what can I do
+veridict --version && veridict --help
 
 # the system audits itself: ledger → claims → jury → certificate → offline verify
 python scripts/dogfood.py
 
 # verify a certificate offline (the property third parties care about)
-# (ledger + cert are release assets: gh release download v0.3.2
-#  or https://github.com/goun7/veridict/releases)
+# ledger + cert ship as release assets: gh release download --latest
 veridict verify --ledger dogfood_ledger.jsonl --cert dogfood_cert.json
+
+# your own repo, three commands: see "Audit your own repo" below
 
 # regenerate the standard's conformance test vectors (deterministic)
 python scripts/build_test_vectors.py
@@ -68,10 +69,12 @@ A failing audit turns it amber or red — worst-verdict-wins.
 
 | Check | Result |
 |---|---|
-| Test suite | 260 passed (both invocation styles, Python 3.12–3.14 in CI) |
+| Test suite | 376 passed (both invocation styles, Python 3.12–3.14 in CI) |
 | Self-audit | valid certificate, risk `low`, GATE not blocked |
 | Offline replay | `veridict verify` rc 0 on the dogfood certificate |
-| Canary protocol | 10 catches / 3 honest misses / 0 false positives across 12 defect classes |
+| Canary (scripted jury) | 23 catches / 3 honest misses / 0 false positives across 26 defect classes — measures a hand-authored refutation table, **not model capability**; labeled as such |
+| Canary (real LLM, lower bound) | **2/25** classes caught, **0 false positives**, by local qwen2.5:3b + llama3.2:3b — the audit's end-to-end catch rate; the earlier 23/25 figure was inflated by a metric bug that counted coverage-meta-claim refusals as findings; sheets in `docs/notes/` |
+| Judgment sonde (model, decoupled from the ladder) | **42/48** correct refutations of defective artifacts by the same 3B jurors (23/24 + 19/24), but **2/4 false refutations on clean code** — the model sees most of the defects; §5.3 rule 2 keeps those refutations from turning a W1a-supported verdict, and the false-refutation rate is the measured justification for that rule |
 | Tamper soak | 1500 mutated ledgers, 5 seeds → 100% detected, 0 silent passes |
 | Spec parity | reference verifier ≡ spec-only verifier on 8 failure modes |
 
@@ -151,7 +154,94 @@ jobs:
 
 The run uploads `veridict-audit` artifacts (ledger + certificate) — download
 once, verify forever: `veridict verify --ledger veridict-ledger.jsonl --cert
-veridict-cert.json`. See the workflow file for all inputs.
+veridict-cert.json`. See the workflow file for all inputs — notably
+`anchor: rekor` (pin the checkpoint to the public transparency log; the
+verify step checks the sidecar automatically) and `actor-family` (declare
+the authoring model's family and same-family jury opinions are excluded —
+the self-preference guard).
+
+By default the jury runs on scripted stubs (loudly marked in the report —
+stubs never pretend to be judges). To bring a real model jury, the action
+reads the same environment as the CLI — step-level `env:` flows into
+composite steps:
+
+```yaml
+      - uses: goun7/veridict@v1
+        env:
+          VERIDICT_JURY_URL: https://api.openai.com/v1      # any OpenAI-compat
+          VERIDICT_JURY_KEY: ${{ secrets.JURY_KEY }}
+          VERIDICT_JURY_MODEL: gpt-4o
+          VERIDICT_JURY_URL2: https://api.anthropic.com/... # a 2nd FAMILY
+          VERIDICT_JURY_KEY2: ${{ secrets.JURY_KEY2 }}      # (required: juries
+          VERIDICT_JURY_MODEL2: claude-sonnet-4-5           #  need ≥2 families)
+        with:
+          intent: "DOCTRINE: ..."
+```
+
+## From certificate to settlement
+
+A certificate proves what happened. It does not by itself authorize
+payment — a settlement layer still has to decide whether *this* verified
+work qualifies, and that decision has to fail closed on its own.
+`veridict settle` is that boundary:
+
+```bash
+# certificate already verified offline (veridict verify)
+veridict settle --cert dogfood_cert.json --out claim.json   # derive
+veridict settle --cert dogfood_cert.json --claim claim.json  # reconcile
+```
+
+The claim is derived only from certificate fields — accepted claims, jury
+families, risk level — under a policy that is itself part of the claim's
+digest, so the caller cannot swap in a more permissive policy after
+seeing the verdict. Reconciliation never trusts the presented claim: it
+recomputes it from the certificate, so inflating `accepted_claims` (or
+flipping `valid`, or presenting a claim minted against a different
+certificate) is refused. Exit code 0 means the claim holds; non-zero
+means it does not — a pipeline that ignores the report and pays on any rc
+has a bug, and the tool will not help it.
+
+This is deliberately a **claim generator**, not a payment executor. It
+answers "was provably-done work done", not "should money move". Keeping
+those separate is what stops a dropped or replayed settlement message
+from becoming a silent release.
+
+## Interoperability
+
+**Positioning vs runtime governance** (e.g. microsoft/agent-governance-
+toolkit): those constrain agents *before/during* actions; Veridict
+adjudicates *after* the fact into a certificate a counterparty verifies
+without trusting vendor, auditor, or runtime. Directions of flow differ —
+a deployment can run both, and the runtime's own action logs are exactly
+the evidence class an audit anchors on.
+
+Two ways a Veridict verdict reaches tooling that never heard of us:
+
+- **External anchoring** — `veridict audit … --anchor rekor` (or in CI, the
+  `anchor: rekor` action input; or `veridict anchor publish`) pins the certificate's checkpoint to the Sigstore
+  Rekor public-good transparency log. The anchor proves *existence at time T*;
+  authority stays with the certificate's own key. Anyone holding cert + ledger
+  + anchor sidecar checks it fully offline:
+  `veridict verify --ledger L --cert C --anchor A` (pinned Rekor key, no
+  network, no trust in us). The v1 release's dogfood certificate is anchored
+  live — see `docs/receipts-anchor-v1-dogfood.json`.
+- **SLSA export** — `veridict export --format vsa` projects a certificate onto
+  a SLSA v1.2 Verification Summary Attestation (in-toto Statement) so existing
+  supply-chain policy engines can consume the verdict. The VSA is a lossy
+  projection: it names the certificate by digest (`inputAttestations`) and
+  embeds the full binding as a spec-sanctioned extension field; the
+  certificate remains the authoritative object. Optional `--sign KEYFILE`
+  wraps it in a DSSE envelope under the issuing key.
+- **SPDX 3.0.1 export** — `veridict export --format spdx` emits an SPDX 3.0.1
+  AI-profile JSON-LD document, validated in CI against the pinned official
+  schema. The audited artifact rides as an `ai_AIPackage` (identity, digest,
+  supplier); every audit semantic — claims, evidence, jury composition, risk,
+  Rekor anchor — rides on core Annotation/Relationship/ExternalRef elements.
+  Deliberate limit: the AI profile models AI *systems*, not audit verdicts,
+  so no `ai_*` field is made to carry a meaning the spec does not give it
+  (our risk_level never occupies ai_safetyRiskAssessment — there is a test
+  locking that refusal in). The `certificationReport` externalRef binds the
+  authoritative certificate by canonical digest.
 
 ## Public site
 
@@ -168,12 +258,37 @@ better one."* — is on [dev.to](https://dev.to/goun7/agents-already-found-their
 - **Architecture:** [`ARCHITECTURE.md`](ARCHITECTURE.md) — module map to standard sections
 - **Commercial model:** [`docs/commercial-model.md`](docs/commercial-model.md) — open-core model, growth levers, anti-corruption guardrails
 - **Contributing / Governance / Security:** [`CONTRIBUTING.md`](CONTRIBUTING.md) · [`GOVERNANCE.md`](GOVERNANCE.md) · [`SECURITY.md`](SECURITY.md)
+- **Building your own verifier** (independent of this codebase, issue #1): [`docs/verifier-onboarding.md`](docs/verifier-onboarding.md) — closure kit: trusted-artifact table, byte-level traps list, one-command parity harness, proofs-as-behavioral-spec
 
 ## Status & roadmap
 
+**Formal core (Sep 2026):** every structural layer of the core is
+machine-checked in Lean (v4.34, kernel-only). The ladder
+(`proofs/ladder/Ladder.lean`) proves seven invariants over evidence lists
+of *arbitrary* length — fail-safe-empty, no-silent-pass, W1a-decisiveness,
+doctrine-can-never-topple, escalation conditions, split visibility,
+meta-budget — and a generated oracle (`TruthTable.lean`, digest-tied to the
+bounded receipt) re-verifies the model against all 28,080 sampled cases on
+every CI run; its first build caught a real model-vs-code divergence and
+the model moved. The ledger chaining (`proofs/ledger/Chain.lean`) proves
+six theorems over chains of *arbitrary* length — writer/reader agreement,
+prefix-closure, payload-edit and honest-remint tamper detection (the one
+collision hypothesis is *stated*, not smuggled), genesis-rooting. The
+anchor sidecar (`proofs/anchor/Anchor.lean`) proves nine theorems about
+certificate⇄CT cross-verification — its headline (A4): with the wrong
+binding, valid ECDSA signatures cannot rescue a sidecar; structural
+rejection is unconditional. ECDSA itself stays honest TCB: no structural
+proof discharges a computational assumption, so it enters the model as a
+disclosed opaque boolean rather than being silently "proven". Trust
+placement (kernel `decide`; disclosed `native_decide` for the oracle lane
+only) and the measured axiom footprints (C1 and I1/I7 axiom-free; the rest
+`[propext]`/`Quot.sound`-maximal) are disclosed in the file headers and
+re-printed by `proofs.yml` on every run — per house doctrine: receipts,
+not narrative.
+
 Phase 1 (core) and Phase 2 (watcher layer) are implemented with end-to-end
 receipts in the dogfood run. Phase 3 (platform + standard) substrate is in
-place: spec draft, conformance kit (C1–C10), marketplace index, test vectors,
+place: spec draft, conformance kit (C1–C13), marketplace index, test vectors,
 spec-only verifier. The remaining exit criteria are external by nature:
 
 1. an **independent verifier** implemented from the spec by someone else,
@@ -186,21 +301,3 @@ expansion plan is [Roadmap v2 (#10)](https://github.com/goun7/veridict/issues/10
 formal verification); the commercial
 model is documented in [`docs/commercial-model.md`](docs/commercial-model.md).
 
-## Contributing
-
-Start with the issue tracker — the tracker is seeded with the project's own
-exit criteria:
-
-- **[Independent verifier from the standard alone](https://github.com/goun7/veridict/issues/1)** (exit criterion ①) — write a verifier without reading our code; where you and the reference disagree, either the standard is ambiguous or someone is wrong, and both findings earn errata credit.
-- **[Good-first issues](https://github.com/goun7/veridict/labels/good-first-issue)** — e.g. canary corpus expansion (self-contained, tests included as reference).
-- **[Errata proposals](https://github.com/goun7/veridict/issues/new?template=standard_errata.md)** — a normative sentence that is wrong, ambiguous, or unimplementable. Accepted errata land in §14.2 with credit.
-
-All work is governed by the receipts culture: tests and regenerated
-evidence over claims. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
-
-## Model
-
-Open-core: the standard, the ledger core, and the offline verifier are
-Apache-2.0 — forever. Commercial offerings (hosted platform, watcher
-certification, enterprise integrations) build on top and never gate the
-open core. See [`docs/commercial-model.md`](docs/commercial-model.md).

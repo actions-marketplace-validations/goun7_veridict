@@ -1,8 +1,25 @@
-"""Blind heterogeneous jury (§5.2). Members never see each other's doctrine."""
+"""Blind heterogeneous jury (§5.2). Members never see each other's doctrine.
+
+Calibration layer (added 0.4.0, grounded in the LLM-as-judge literature):
+
+- **Self-preference exclusion** — an AI from the same model family as the
+  audited artifact's author cannot sit on its jury (self-enhancement bias:
+  Zheng et al., arXiv:2306.05685; self-preference bias: Watai et al.,
+  arXiv:2410.21819). The author's family is declared by the auditor
+  (`author_family` / VERIDICT_ACTOR_FAMILY); undeclared means no exclusion.
+- **Evidence-first (MEC)** — jurors must list concrete observations BEFORE
+  rating (Multiple Evidence Calibration, Wang et al., arXiv:2305.17926).
+- **Sample calibration** — optional repeated independent calls
+  (VERIDICT_JURY_SAMPLES>1, temperature floored at 0.7 so repeats are
+  genuinely sampled): strict-majority stance wins, confidence is discounted
+  by the agreement fraction, and a split with no majority abstains
+  ("sample-split") instead of silently averaging an inconsistency.
+"""
 from __future__ import annotations
 
 import json
 import os
+from collections import Counter
 from dataclasses import dataclass
 
 import httpx
@@ -11,6 +28,52 @@ from .schemas import ActorRef, Claim, EvidenceItem
 from .utils import sha256_hex
 
 EID_SALT = "veridict-jury-v1"
+
+# Guards on source text passed to jurors: unbounded context would break
+# small local models (and cost on hosted ones), and a juror does not need
+# every file to judge one claim.
+_MAX_SOURCE_BYTES = 6000
+_MAX_SOURCE_FILES = 6
+
+
+def _read_sources(artifact_dir: str | None) -> str | None:
+    """Bounded read of the artifact's own source, for the jury's doctrine.
+
+    A digest alone tells a juror nothing about the code, so a doctrine
+    call without source text asks the model to judge a hash — which the
+    real-LLM canary showed it refuses ('the digest provides no information'),
+    producing refusals that read as refutations. This reads the artifact's
+    own .py files, bounded in both count and bytes, so a juror judging a
+    claim can actually see the thing the claim is about.
+    """
+    if not artifact_dir:
+        return None
+    try:
+        names = sorted(os.listdir(artifact_dir))
+    except OSError:
+        return None
+    chunks: list[str] = []
+    total = 0
+    taken = 0
+    for name in names:
+        if taken >= _MAX_SOURCE_FILES or total >= _MAX_SOURCE_BYTES:
+            break
+        if not name.endswith(".py") or name.startswith("test_"):
+            continue
+        path = os.path.join(artifact_dir, name)
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                text = f.read(_MAX_SOURCE_BYTES - total)
+        except OSError:
+            continue
+        if not text.strip():
+            continue
+        chunks.append(f"--- {name} ---\n{text}")
+        total += len(text)
+        taken += 1
+    if not chunks:
+        return None
+    return "\n\n".join(chunks)
 
 
 @dataclass(frozen=True)
@@ -42,7 +105,8 @@ class ScriptedProvider:
         self.fn = fn
         self.revise = revise
 
-    def doctrine(self, claim_summary: str, artifact_digest: str) -> Opinion:
+    def doctrine(self, claim_summary: str, artifact_digest: str,
+                 sources: str | None = None) -> Opinion:
         if self.fn is not None:
             return self.fn(claim_summary)
         return self.responses.get(claim_summary, self.default)
@@ -51,20 +115,95 @@ class ScriptedProvider:
 class OpenAICompatProvider:
     """Any OpenAI-compatible chat endpoint; expects strict-JSON opinion back."""
     def __init__(self, family: str, identity: str, version: str = "0.1.0",
-                 base_url: str | None = None):
+                 base_url: str | None = None, api_key: str | None = None,
+                 model: str | None = None):
+        # Explicit params exist because a two-FAMILY jury genuinely needs
+        # two credentials: before this, VERIDICT_JURY_URL2 jurors silently
+        # borrowed provider 1's key and model — "heterogeneous jury" was
+        # then one model answering itself through two gateways.
         self.family = family
         self.identity = identity
         self.version = version
         self.base_url = base_url or os.environ["VERIDICT_JURY_URL"]
-        self.api_key = os.environ.get("VERIDICT_JURY_KEY", "")
-        self.model = os.environ.get("VERIDICT_JURY_MODEL", "gpt-4o-mini")
+        self.api_key = (api_key if api_key is not None
+                        else os.environ.get("VERIDICT_JURY_KEY", ""))
+        self.model = (model if model is not None
+                      else os.environ.get("VERIDICT_JURY_MODEL", "gpt-4o-mini"))
 
-    def doctrine(self, claim_summary: str, artifact_digest: str) -> Opinion:
+    # -- calibration knobs (env so CI workflows can set them per-run) ----
+    def _samples(self) -> int:
+        try:
+            return max(1, int(os.environ.get("VERIDICT_JURY_SAMPLES", "1")))
+        except ValueError:
+            return 1
+
+    def _temperature(self, samples: int) -> float:
+        env = os.environ.get("VERIDICT_JURY_TEMPERATURE")
+        if env is not None:
+            try:
+                return float(env)
+            except ValueError:
+                pass
+        # Repeated calls at temperature 0 return identical strings — they
+        # measure nothing. If samples are requested, actually sample.
+        return 0.0 if samples <= 1 else 0.7
+
+    def doctrine(self, claim_summary: str, artifact_digest: str,
+                 sources: str | None = None) -> Opinion:
+        n = self._samples()
+        if n <= 1:
+            return self._one(claim_summary, artifact_digest, self._temperature(n),
+                             sources)
+        ops: list[Opinion] = []
+        temp = self._temperature(n)
+        for _ in range(n):
+            ops.append(self._one(claim_summary, artifact_digest, temp, sources))
+        counts = Counter(o.stance for o in ops)
+        top_stance, top_n = counts.most_common(1)[0]
+        if top_n * 2 <= n:                       # no strict majority
+            # Honest degradation: an unresolved sample split is NOT evidence.
+            raise ProviderError(f"sample-split, no majority: {dict(counts)}")
+        agree = top_n / n
+        same = [o.confidence for o in ops if o.stance == top_stance]
+        conf = (sum(same) / len(same)) * agree
+        base_rationale = next(o.rationale for o in ops if o.stance == top_stance)
+        note = f" [sample-calibration: {top_n}/{n} {top_stance}]"
+        return Opinion(top_stance, conf, base_rationale + note)
+
+    def _timeout(self) -> float:
+        """Per-call timeout. Configurable because a small local model can
+        legitimately take minutes on the evidence-first prompt, while a
+        hosted endpoint that slow is a broken endpoint — the same default
+        serves the common case and the env knob serves the edge."""
+        try:
+            return max(10.0, float(os.environ.get("VERIDICT_JURY_TIMEOUT", "60")))
+        except ValueError:
+            return 60.0
+
+    def _one(self, claim_summary: str, artifact_digest: str,
+             temperature: float, sources: str | None = None) -> Opinion:
+        # The artifact's source is included when available: a juror judging
+        # a claim about code must see the code. Without it the model sees
+        # only a digest, which carries no information about the code, and
+        # the real-LLM canary showed the outcome — refusals dressed as
+        # refutations ('the digest does not provide any information about
+        # the function'). Abstention is the honest answer to a claim you
+        # cannot evidence; this makes the claim evidencable instead.
+        source_block = (f"\n\nArtifact source (authoritative — judge against "
+                        f"this, not against assumptions):\n{sources}"
+                        if sources else "")
         prompt = (
-            "You are an independent audit juror. You see ONE claim and an artifact "
-            "digest. You do NOT see other jurors' opinions. Respond ONLY with JSON: "
-            '{"stance": "SUPPORTS"|"REFUTES", "confidence": 0..1, "rationale": "..."}\n'
-            f"Claim: {claim_summary}\nArtifact digest: {artifact_digest}")
+            "You are an independent audit juror. You see ONE claim and the "
+            "artifact it is about. You do NOT see other jurors' opinions. "
+            "Respond ONLY with JSON: "
+            '{"evidence": ["<concrete observation>", "..."], '
+            '"stance": "SUPPORTS"|"REFUTES", "confidence": 0..1, "rationale": "..."}\n'
+            "List at least two concrete observations in `evidence` BEFORE deciding "
+            "— evidence first, verdict second. Quote what you actually see in "
+            "the source; if the source does not settle the claim, REFUTE with "
+            "low confidence and say so — do not guess.\n"
+            f"Claim: {claim_summary}\nArtifact digest: {artifact_digest}"
+            f"{source_block}")
         try:
             resp = httpx.post(
                 self.base_url.rstrip("/") + "/chat/completions",
@@ -72,15 +211,30 @@ class OpenAICompatProvider:
                          if self.api_key else {}),
                 json={"model": self.model,
                       "messages": [{"role": "user", "content": prompt}],
-                      "temperature": 0},
-                timeout=60)
+                      "temperature": temperature},
+                timeout=self._timeout())
             resp.raise_for_status()
             content = resp.json()["choices"][0]["message"]["content"]
             data = json.loads(content)
             stance = data["stance"]
             if stance not in ("SUPPORTS", "REFUTES"):
                 raise ProviderError(f"bad stance: {stance}")
-            return Opinion(stance, float(data["confidence"]), str(data["rationale"]))
+            rationale = str(data["rationale"])
+            evidence = data.get("evidence")
+            if evidence is not None:
+                # MEC shape check: non-empty list of real observations.
+                if (not isinstance(evidence, list) or len(evidence) < 2
+                        or not all(isinstance(e, str) and e.strip()
+                                   for e in evidence)):
+                    raise ProviderError(f"bad evidence: {evidence!r}")
+                rationale = "evidence: " + "; ".join(
+                    e.strip() for e in evidence) + " | " + rationale
+            else:
+                # Legacy single-rationale replies stay acceptable (a strict
+                # reject would silently shrink juries in the field), but the
+                # receipt records that this opinion was NOT evidence-first.
+                rationale += " [no-evidence-field]"
+            return Opinion(stance, float(data["confidence"]), rationale)
         except Exception as exc:   # noqa: BLE001 — transport AND contract
             # failures must degrade to ProviderError (an abstaining juror),
             # never crash the audit. Found by the local-mock e2e test: an
@@ -90,18 +244,44 @@ class OpenAICompatProvider:
 
 
 class Jury:
-    def __init__(self, providers: list) -> None:
+    def __init__(self, providers: list, *, author_family: str | None = None) -> None:
+        # Self-preference exclusion (see module docstring): a juror from the
+        # audited author's own model family must not rate the author's work.
+        # The filter runs BEFORE the >=2-family validation — if the author's
+        # family was all the jury had, the jury fails closed (ValueError),
+        # it never quietly shrinks to a conflicted panel.
+        self.excluded: list = []
+        if author_family:
+            af = author_family.strip().lower()
+            kept = []
+            for p in providers:
+                if p.family.strip().lower() == af:
+                    self.excluded.append(p)
+                else:
+                    kept.append(p)
+            providers = kept
         families = {p.family for p in providers}
         if len(providers) < 2 or len(families) < 2:
             raise ValueError("jury requires >=2 providers from >=2 distinct families (§5.2)")
         self.providers = providers
 
-    def evaluate(self, claim: Claim, artifact_digest: str) -> tuple[list[EvidenceItem], list[str]]:
+    def evaluate(self, claim: Claim, artifact_digest: str,
+                artifact_dir: str | None = None
+                ) -> tuple[list[EvidenceItem], list[str]]:
         items: list[EvidenceItem] = []
-        abstained: list[str] = []
+        abstained: list[str] = [f"{p.identity} (self-preference: "
+                                f"author family '{p.family}')"
+                                for p in self.excluded]
+        # The jury's doctrine is only meaningful if a juror can see what it
+        # is judging. Without source text a juror sees a digest — a hash
+        # says nothing about the code — and the real-LLM canary showed the
+        # result: REFUTES with rationale 'the digest does not provide any
+        # information', i.e. a rejection of the question rather than the
+        # code. Passing source text is opt-in (audit sets it) and bounded.
+        sources = _read_sources(artifact_dir) if artifact_dir else None
         for p in self.providers:                     # sequential, isolated: blind by construction
             try:
-                op = p.doctrine(claim.summary, artifact_digest)
+                op = p.doctrine(claim.summary, artifact_digest, sources)
             except ProviderError:
                 abstained.append(p.identity)         # abstain ≠ refute: no evidence item
                 continue
@@ -132,7 +312,6 @@ class Jury:
         without a revise hook the provider keeps its first-round opinion. The
         first-round items stay in the ledger untouched.
         """
-        by_identity = {p.identity: p for p in self.providers}
         packets: dict[str, list[dict]] = {
             p.identity: [{"identity": it.producer["identity"],
                           "family": it.producer.get("family"),

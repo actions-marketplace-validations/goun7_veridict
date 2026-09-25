@@ -1,0 +1,30 @@
+{
+  "watcher_id": "example-aiact-transparency",
+  "name": "Example EU AI Act Transparency Watcher",
+  "version": "0.1.0",
+  "producer": {
+    "identity": "example-aiact-transparency",
+    "maintainer": "veridict-examples"
+  },
+  "capabilities": {
+    "evidence_classes": [
+      "STATIC_ANALYSIS"
+    ],
+    "max_tier": "W1b",
+    "subscribes_to": [
+      "aiact",
+      "transparency",
+      "disclosure",
+      "gpai"
+    ]
+  },
+  "resource_class": {
+    "timeout_seconds": 60,
+    "cost_budget": 0.0,
+    "sandbox_level": "inprocess"
+  },
+  "integrity": {
+    "code_hash": "3203175dda1ade90fbc28d057ffefea67ee5b6692c0e84a6ad37efce27f9f0c7",
+    "update_policy": "manual"
+  }
+}

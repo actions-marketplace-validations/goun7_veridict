@@ -20,11 +20,19 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install
-        run: pip install -e . && pip install pytest cryptography
+        # langchain-core / llama-index-core are the real adapter targets.
+        # Without them the adapter tests skip in CI — and a skipped test
+        # cannot prove an adapter works against the framework it ships for.
+        # They are optional at runtime (import-guarded), required here.
+        run: |
+          pip install -e . && pip install pytest cryptography pyyaml jsonschema \
+            langchain-core llama-index-core
       - name: Full suite (python -m pytest)
         run: python -m pytest -q
       - name: Full suite (pytest entrypoint)
         run: pytest -q
+      - name: Verifier parity (reference CLI == spec-only verifier)
+        run: python scripts/crosscheck_verifier.py
       - name: Dogfood self-audit (receipt)
         run: |
           python scripts/dogfood.py > dogfood_out.json
@@ -57,14 +65,14 @@ jobs:
         run: |
           pip install pip-audit
           pip-audit --skip-editable --desc off || test $? -eq 1
-      - name: Canary quality sheet (caught 10 / fp 0 expected)
+      - name: Canary quality sheet (caught 23 / fp 0 expected)
         run: |
           python - <<'EOF'
           import sys; sys.path.insert(0, '.')
           from tests.test_canary import _audit_fn
           from veridict.canary import CanaryRunner
           s = CanaryRunner(_audit_fn()).run('corpus/corpus.jsonl')
-          assert s['caught_total'] == 10 and s['false_positives'] == 0, s
+          assert s['caught_total'] == 23 and s['false_positives'] == 0, s
           print('canary caught:', s['caught_total'], '| fp:', s['false_positives'])
           EOF
       - name: GATE latency budget (design §6.5, p95 < 30 min)

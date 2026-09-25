@@ -47,7 +47,16 @@ def adjudicate(claim: Claim, evidence: list[EvidenceItem], policy,
     w1a = [e for e in evidence if e.tier == "W1a"]
     w1b = [e for e in evidence if e.tier == "W1b"]
     w2plus = [e for e in evidence if e.tier in ("W2", "W3")]
-    divergence = compute_divergence(evidence, getattr(policy, "divergence_tolerance", 1 / 3))
+    # The declaration's own divergence_tolerance is authoritative (audit F5):
+    # a value set on thresholds.divergence_tolerance was unreachable from
+    # here, so an operator tuning it changed nothing while the declaration's
+    # own field decided. Prefer the declaration field; the thresholds copy
+    # stays readable for certs in the wild that serialize it there.
+    tol = getattr(policy, "divergence_tolerance", None)
+    if tol is None:
+        tol = getattr(getattr(policy, "thresholds", None),
+                      "divergence_tolerance", 1 / 3)
+    divergence = compute_divergence(evidence, tol)
     risk: list[str] = []
     if first_round_split:
         risk.append(SPLIT_RESOLVED_NOTE if divergence != "SPLIT"
@@ -116,6 +125,19 @@ def adjudicate(claim: Claim, evidence: list[EvidenceItem], policy,
         if divergence == "SPLIT":
             risk.append("R4: doctrinal split on a non-critical claim — not escalated")
             return Adjudication(claim.claim_id, "INCONCLUSIVE", divergence, Rung.R4,
+                                tuple(risk), tuple(metas))
+        # Tier ordering (§5.3 rule 1): W1b deterministic static truth outranks
+        # W2 doctrine. A W1b SUPPORT cannot be overturned into REFUTED by a
+        # juror's disagreement — the real-LLM canary showed 3B models REFUTE
+        # claims they cannot evidence (rationale: 'the digest provides no
+        # information about the function'), and letting that dissent decide
+        # produced a false positive on clean code. W1b support keeps the
+        # claim VERIFIED; the dissent stays visible in the divergence field
+        # instead of being silently promoted into the verdict.
+        if any(e.tier == "W1b" and e.stance == "SUPPORTS" for e in w1b):
+            risk.append("R4: W1b support outranks doctrinal dissent (§5.3 rule 1)"
+                        " — dissent recorded, verdict stands")
+            return Adjudication(claim.claim_id, "VERIFIED", divergence, Rung.R4,
                                 tuple(risk), tuple(metas))
         value = "VERIFIED" if all(e.stance == "SUPPORTS" for e in w2plus) else "REFUTED"
         risk.append("R4: doctrinal-only verdict; no machine evidence backs this claim")

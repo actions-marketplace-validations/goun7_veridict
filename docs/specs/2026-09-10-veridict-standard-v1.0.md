@@ -207,7 +207,10 @@ evidence sets; "all-SUPPORTS" is over every evidence item on the claim.
   flagged `inconclusive-unresolved:{claim_id}`; all doctrinal stances
   SUPPORTS ⇒ VERIFIED; ANY doctrinal REFUTES — even inside a MAJORITY
   favoring SUPPORTS ⇒ REFUTED (fail-closed: a lone doctrinal dissenter
-  blocks, never passes). W3-only evidence (no W2) ⇒ INCONCLUSIVE (§4.3 rule
+  blocks, never passes). *W1b present but W1a absent* ⇒ W1b SUPPORT outranks
+  doctrine per §5.3 rule 1: verdict VERIFIED, dissent recorded in the
+  divergence field and not promoted into the verdict (Erratum D14).
+  W3-only evidence (no W2) ⇒ INCONCLUSIVE (§4.3 rule
   5). Every remaining case ⇒ INCONCLUSIVE — a conforming implementation has
   NO silent pass. *Errata (§14.2):* the design's R2 makes SPLIT handling
   mode-dependent (CERTIFICATE proceeds with a risk note); v1.0.0 keeps
@@ -260,18 +263,81 @@ post-issuance fake deliberation entry must never be able to erase refuting
 evidence from a replay (v1.0.0 erratum D4: the unbounded form of this rule
 was exploitable and is forbidden).
 
+9.5 **Certificate fields are reconciled, never trusted (errata D17, D18,
+D19, D20).** A certificate carries two KINDS of field that are not independent
+evidence, and a conforming verifier must handle both.
+
+(a) **Derived summaries** — fields that FOLLOW from the claim verdicts:
+`risk_level`, `score`, `divergence_summary` (D17, D18). Recompute every
+one from the verdicts validated in this same pass and reject any
+divergence. The requirement is stated for the CLASS, not the field names:
+any future field that summarizes verdicts inherits it without further
+errata. Two fields that must agree, with no rule checking that they
+agree, is the same hazard D12 and D15 closed; the exposure is a framing
+attack (good work shown as risky, or a disagreement hidden as settled),
+not a pass-through, because the verdicts a summary rests on are
+themselves recomputed.
+
+(b) **Inputs to the verdicts** — fields the replay USES rather than
+derives: `policy_ref` and its duplicate `policy_mode` (D19). These are
+strictly more dangerous than summaries, because forging one changes the
+verdicts rather than only their description. A conforming verifier MUST
+NOT replay under the certificate's own description of the policy: it MUST
+reconcile `policy_ref` against the policy the ledger records the run
+actually used (`policy.decision` carries `policy_digest`), MUST reject a
+digest mismatch, and MUST fail closed when the claimed `policy_id` has no
+recorded entry — an unrecorded policy is unfalsifiable and the first fix
+attempt skipped the check entirely, which is the same class as D17 but
+worse.
+
+Scope note for (b), kept honest: this binds the certificate to the
+ledger's record of the policy, which is tamper-evident but only as
+meaningful as the policy the issuer actually ran. An issuer who runs a
+lenient policy and records it honestly gets a certificate that honestly
+reflects a lenient policy. The rule removes the ability to claim one
+policy and have run another; it does not make the claimed policy strict.
+
+(c) **The replay scope itself (D20).** Reconciliation is only meaningful
+if the replay reads the same ledger the anchor pins. Every entry the
+replay trusts — `claim.registered`, `evidence.recorded`, the
+`deliberation.rounded` supersession set, the `policy.decision` record —
+MUST be restricted to the anchored prefix (`seq <= checkpoint_seq`). The
+certificate's signed anchor pins that prefix's chain_hash, so entries
+inside it are tamper-evident; entries appended after issuance are outside
+the pin and MUST NOT reach the replay. The failure mode is asymmetric in
+both directions: an appended entry can rescue an unattested certificate
+(D19) or flip a verdict to match a forged one (D20 — a W1a SUPPORTS item
+turns an honestly-INCONCLUSIVE claim VERIFIED, because the ladder gives
+W1a priority over W2). `key.enrolled` lookup is exempt: `next()` takes
+the first matching entry and the ledger is append-only, so the issuer's
+enrollment always precedes a later duplicate.
+
 ## 10. Policy engine
 
 10.1 Modes: `CERTIFICATE` (record only), `GATE` (fail-closed),
 `WATCH` (observe-only — never blocks), `HYBRID` (gate semantics + full
 record).
 
-10.2 The decision is blocked iff `critical_bad ∨ any_REFUTED ∨ flags` under
-GATE/HYBRID. Registered v1.0.0 flags: `coverage-below-threshold`,
+10.2 The decision is blocked iff `critical_bad ∨ any_REFUTED ∨ blocking_flags`
+under GATE/HYBRID. Registered v1.0.0 flags: `coverage-below-threshold`,
 `divergence-split:{claim_id}`, `inconclusive-unresolved:{claim_id}`. An
 INCONCLUSIVE machine-checkable claim MUST surface a flag — a gate consumer
 MUST be able to distinguish "passed clean" from "passed with an unresolved
 machine claim".
+
+*Erratum D15, second half (§14.2):* not every flag is a verdict.
+`meta-coverage-unconfirmed:{claim_id}` is advisory — it records that a
+juror declined to answer its own coverage question. A flag that blocks
+IS a verdict, and letting an advisory one block hands the deciding vote
+to the very dissenter §5.3 rule 2 refuses to honor. Measured before the
+fix: 3/3 clean audits blocked under HYBRID with a jury that refutes
+everything, because the jury's refusal to confirm coverage blocked the
+audit it was refusing to cover. The exclusion is from `blocking_flags`
+only — the flag stays visible in the decision, so a consumer that wants
+to treat unconfirmed meta-coverage as a stop signal can, but the gate
+itself does not. The fail-closed surface does not shrink: a refuted
+TOP-LEVEL claim still blocks, critical-class claims still block; only
+the juror's refusal stops deciding.
 
 10.3 WATCH mode records `watch.observed` and never blocks; the flags are
 computed identically. *Errata (§14.2):* v1.0.0 defines WATCH as a policy
@@ -352,8 +418,12 @@ of independence; the diversity statement travels in `jury_composition`.
 heterogeneity is preserved and the composition is disclosed.
 
 13.4 Formal verification of the Core is a Phase 3 stretch goal and is NOT a
-v1.0.0 conformance requirement. Until then, the core's honesty rests on the
-canonical-form discipline and the replay algorithm — a stated residual risk.
+v1.0.0 conformance requirement. Partial progress exists (erratum D11: the
+§7 ladder's five tier rules are machine-checked in Lean 4), but that covers
+the adjudication *logic* only — the hash chain, signature layer, and juror
+honesty remain unproven. Until those are covered too, the core's honesty
+rests on the canonical-form discipline and the replay algorithm — a stated
+residual risk.
 
 ## 14. Registry governance
 
@@ -404,8 +474,292 @@ audited ledger." Ratification is deferred to v1.1 (§10.3 errata).
 [`2026-09-12-veridict-standard-v1.1-delta.md`](2026-09-12-veridict-standard-v1.1-delta.md)
 (amendment A1 proposes ratifying this exact sentence; the delta stays DRAFT
 until an independent implementation exercises it). Erratum D10 remains OPEN
-until v1.1.0 is ratified.*
+until v1.1.0 is ratified.* Erratum D11 (2026-09-19, issue #8): the §7
+ladder's five tier rules are now machine-checked in Lean 4
+(`proofs/ladder/Ladder.lean`, kernel-checked, no bespoke axioms — the
+`agree` decision function depends only on `propext`, `Classical.choice`,
+and `Quot.sound`). The model is cross-checked against the shipped Python
+ladder over all 28,080 bounded evidence configurations
+(`proofs/ladder/TruthTable.lean`, regenerated from the reference
+implementation per run by `scripts/export_lean_truth_table.py`), so
+model/implementation divergence inside the sampled domain fails the
+proof CI. **Limits, stated plainly:** this is a proof about the ladder's
+*logic*, not about the system. It says the decision function admits no
+silent pass and no silent gap for the configurations sampled; it does
+NOT prove the hash chain, the signature layer, or that a deployed
+juror reported honest evidence — those remain §11.3's verification
+business, not §7's. A reviewer asking "is the ladder sound?" now gets a
+checked artifact; a reviewer asking "was this audit truthful?" still
+gets a certificate to recompute.
 
 14.3 The standard is Apache-2.0 (D8: spec + core + offline verifier are
 open; hosted platform, certification authority, enterprise integrations are
 commercial).
+
+**Erratum D12 (2026-09-19, jury composition is normative after all):** the
+reference implementation requires a jury of **at least two providers drawn
+from at least two distinct `family` values** before it will issue a
+certificate, but §5 never stated that requirement as normative text — §5.2
+defines only tier semantics. An implementer reading this standard alone
+could lawfully build a single-provider jury that self-reviews its own
+output, which is exactly the self-preference the requirement exists to
+forbid. This closes that gap: a conforming implementation MUST NOT issue a
+certificate on a jury of fewer than two providers or fewer than two
+families. The reference implementation additionally excludes any juror
+from the audited author's own model family *before* this count and fails
+closed rather than shrinking to a conflicted panel — implementations MUST
+do both. Amendment A2 proposes ratifying these sentences; the delta stays
+DRAFT until an independent implementation exercises it (issue #1's exit
+criterion). Note the limit: these rules constrain *composition*, not
+*honesty* — two families do not prove either juror reported truthfully,
+which remains §11.3's business. *Status (2026-09-20): the rule is
+normative here in §14.2 (this erratum) and enforced in the reference
+implementation at `Jury.__init__`, which refuses a panel of fewer than
+two providers or two families BEFORE any certificate is issued —
+measured, not asserted. The ratification text now exists in
+[`2026-09-12-veridict-standard-v1.1-delta.md`](2026-09-12-veridict-standard-v1.1-delta.md)
+(amendment A2, same shape as A1); it stays DRAFT until an independent
+implementation exercises it. Until then a verifier checking this rule
+reads it from this erratum, not from a ratified §5.*
+
+**Erratum D13 (2026-09-19, entry_type taxonomy was implicit):** §2 lists
+`entry_type` as a field but never enumerated its permitted values, and the
+JSON Schema described the registry as "open" with only an example list —
+which omitted `task.started`, `watch.observed`, `escalation.requested`,
+`escalation.resolved`, `calibration.updated`, `gate.blocked`, and
+`actor.output`, all of which the reference implementation emits. An
+implementer reading the text alone could not know these exist. The schema
+now enumerates the core types in full. The registry remains open by
+design, but extensions MUST be namespaced `extension.*`, so a verifier
+facing an unknown type abstains instead of silently misparsing it — the
+same hazard Sester's ERRATUM-K0.2 closed on their side for their event
+taxonomy. Semantic consumers (any code that totals or nets over entries)
+MUST understand the core types first: a charge and its refund are
+distinguished by entry type, not by a payload field, and a consumer that
+ignores the taxonomy silently diverges.
+
+**Erratum D14 (2026-09-20, R4 did not respect W1b outranking doctrine):**
+R4's text reads "with no W1a/W1b on the claim ... ANY doctrinal REFUTES ⇒
+REFUTED". The guard is correctly stated for the no-W1 case, but the
+reference implementation applied the REFUTED branch without re-checking
+for W1b support, so a claim with deterministic static SUPPORT at W1b
+could still be turned REFUTED by a juror's dissent. That contradicts §5.3
+rule 1 (strict ordering W1a > W1b > W2 > W3): W1b is machine truth, and a
+doctrinal opinion cannot outrank it, only fail to corroborate it. The
+implementation now returns VERIFIED when W1b SUPPORTS and only doctrine
+REFUTES, with the dissent recorded in the divergence field rather than
+promoted into the verdict. The old behavior was not a security hole — it
+erred toward blocking, i.e. toward fail-closed — but it converted a
+juror's *uninformed* refusal into a decision. The real-LLM canary
+measured this exactly: 3B jurors REFUTED claims with the rationale "the
+digest provides no information about the function", and every clean case
+in the corpus was blocked. Two changes follow: (a) the R4 branch now
+honors W1b; (b) jurors now receive the artifact's source text, bounded,
+because a juror that cannot see the code it is judging is not auditing.
+
+**Erratum D15 (2026-09-20, coverage meta-claims were decisive at the
+gate):** R1/R2 open a DOCTRINAL meta-claim ("does the W1a evidence
+actually cover this claim?") precisely *because* a juror dissented. That
+meta-claim's only evidence is the same jury round — it carries no W1
+truth of its own. The policy engine's blocking rule scanned all claims
+including meta-claims, so a juror's refusal to answer its own coverage
+question blocked the gate. The dissenter thereby decided the outcome,
+nullifying §5.3 rule 2 (doctrine can never overturn W1a) by indirection.
+Meta-claims are now recorded, adjudicated, and shown in the certificate,
+and a REFUTED meta-claim is surfaced as `meta-coverage-unconfirmed:{id}`
+rather than promoted to a block. Top-level refuted claims still block as
+before. This is a *narrower* fail-closed surface, not a weaker one: a
+genuine top-level machine refutation still blocks, and an unconfirmed
+coverage question is visible in the certificate and in the run's flags
+instead of silently deciding it.
+
+**Erratum D16 (2026-09-20, the verified-blind spot is real, and it is
+the honest one):** §5.3 rule 2 says doctrine can never overturn W1a
+machine evidence. That rule is correct and stays. But the real-LLM
+canary made the consequence concrete rather than theoretical: a defect
+whose own tests still passes has W1a SUPPORT, so a juror that correctly
+spots the defect in the code cannot turn the verdict. The 25-class
+corpus is deliberately built that way — a bug that fails its tests is
+already caught by W1a and needs no juror — so of 25 defect classes the
+end-to-end audit catches 2. This is not a bug in the ladder; it is the
+design's blind spot, named.
+
+The blind spot is in the DESIGN, not the model. Measured with a judgment
+sonde (scripts/measure_jury_judgment.py) that asks each juror its verdict
+on the intent claim given the artifact's source, deliberately NOT routed
+through the ladder: 42/48 measurements correctly REFUTE the defective
+artifacts (23/24 for qwen2.5:3b, 19/24 for llama3.2:3b), against 2/4 false
+refutations on clean code. The model sees most of the defects; the
+verdict still says VERIFIED, because W1a SUPPORT is machine truth and a
+3B model that calls half the clean code it sees defective must not be
+able to turn a verdict on its own. The false-refutation rate IS the
+justification for rule 2, measured rather than asserted — and the catch
+rate is the cost of it, measured rather than assumed.
+
+Two consequences, both stated so nobody reads a certificate as more
+than it says. (a) A VERIFIED certificate is evidence that machine
+checks passed and jurors did not dissent on the artifact — it is not a
+proof the artifact is correct, only of what was checked. §13 already
+says this normatively; D16 records the measurement that makes it
+load-bearing. (b) The right response to a juror dissent the machine
+evidence contradicts is not to ignore it and not to let it decide, but
+to escalate the coverage question — which is what R1's meta-claim does,
+and what D15 keeps visible. A consumer who wants the dissent to block
+sets the claim's class critical and gets ESCALATED; a consumer who
+wants machine truth to decide gets VERIFIED with the dissent recorded.
+The choice is policy, and both are conforming.
+
+**Erratum D17 (2026-09-20, derived summary fields were unverifiable —
+Tamga ERRATUM-A2 class):** a certificate carries summary fields that
+FOLLOW from the claim verdicts — `risk_level` and `score`. §9 required
+the verifier to recompute the verdicts themselves, and the implementation
+did. But nothing required it to recompute the summaries, and the reference
+implementation did not: it validated each `verdict_value` against the
+ledger and then trusted `risk_level` and `score` as stored. A field that a
+consumer decides on (the settlement policy gates release on `risk_level`)
+was unconstrained by any check.
+
+The consequence is asymmetric, and the asymmetry matters more than the
+bug. An attacker cannot hide a bad result this way: to make the true risk
+`high` a claim verdict must be REFUTED, and verdicts ARE recomputed, so
+the mismatch fires. What an attacker CAN do is the reverse — write
+`risk_level: "high"` over a fully-VERIFIED certificate, or `score: 0.0`
+over a high one. That is a framing attack, not a pass-through: it makes
+good work look bad, or inflates risk to break a settlement that should
+have released. It cannot make bad work pass. The honest statement of the
+exposure is "summary fields could be forged to mislead a consumer", not
+"bad code could be certified".
+
+§9 now requires: a conforming verifier MUST recompute every derived
+summary field from the verdicts it validated, and reject any divergence.
+The reference verifier does. Two fields are derived today; a v1.1 field
+that summarizes verdicts inherits the same rule without further errata,
+because the requirement is stated for the class, not the field names.
+This is the same hazard as D12 and D15 in kind — two fields that must
+agree, with no rule checking that they do — and was found by the same
+method: an independent verifier (Tamga) attacking the standard rather
+than reading the code.
+
+**Erratum D18 (2026-09-20, `divergence_summary` was the second member of
+D17's class):** sweeping the class D17 names found another member in the
+reference implementation. `divergence_summary` maps each claim to its
+adjudication divergence (UNANIMOUS / SPLIT / ...), and the verifier
+checked the verdict values but not this per-claim summary. Same hazard,
+same fix: it is recomputed from the same replay the verdicts come from.
+
+Why it matters more than a cosmetic mismatch: a SPLIT is the trigger for
+deliberation (§9.1), and an honest recorded disagreement is one of the
+few things a certificate exists to surface. Forging it to UNANIMOUS on a
+certificate the verifier accepts would present a contested finding as
+settled — the framing direction of A2', hiding disagreement rather than
+hiding a bad verdict. It cannot manufacture a REFUTED verdict; the
+verdict check still fires. It can hide the disagreement.
+
+One member of the class is deliberately NOT recomputed: `jury_composition`.
+§9.5 applies to fields whose source IS the replayed evidence. The jury's
+family composition is established at issuance and enforced there (D12:
+`Jury.__init__` refuses a panel of fewer than two families before any
+certificate is issued — measured, not asserted), but the ledger carries
+no record of jury composition independent of the evidence producers, so
+a verifier has nothing to recompute it from. The attack path is closed
+at the source instead. A future version that records jury composition
+into the ledger moves this field under §9.5 with no further erratum,
+because §9.5 is stated for the class.
+
+**Erratum D19 (2026-09-20, policy provenance — the hazard D17's sweep
+found, and the one that is an INPUT not a consequence):** sweeping the
+class §9.5 names, three more fields were unconstrained in the reference
+implementation, and one of them is not like the others.
+
+`policy_mode` is the same value stored twice (top level and inside
+`policy_ref`), and the two copies could disagree. Boring duplication —
+recompute one from the other and reject the mismatch.
+
+`policy_ref` is the interesting one. Unlike `risk_level` or
+`divergence_summary`, which FOLLOW from the verdicts, `policy_ref` is used
+to BUILD the replay policy — it is an input to the verdicts, not a
+consequence of them. A verifier that reads the policy from the
+certificate replays under whatever policy the issuer *claims* to have
+used, which means the issuer is trusted for the policy, not just for the
+arithmetic. And the first fix attempt had a fail-open hole exactly here:
+the check looked up a matching `policy.decision` entry in the ledger and
+only compared digests when one existed. A cert claiming a policy_id the
+ledger never recorded therefore SKIPPED the check — unfalsifiable by
+construction. That is the same class as D17 but worse, because a forged
+policy can change verdicts, not just summaries: claim a policy with no
+critical classes and a tolerant divergence threshold over a ledger whose
+real policy was strict, and the replay adjudicates leniently.
+
+§9.5 now requires the check to fail closed when no recorded policy
+matches the claimed policy_id, and to reject a digest mismatch. The
+verifier reconciles the cert's policy against the policy the ledger
+records the run actually used (`policy.decision` carries `policy_digest`),
+rather than trusting the certificate's own description of it.
+
+Scope note, kept honest: this binds the certificate to the ledger's
+record of the policy, which is tamper-evident but is only as meaningful
+as the policy the issuer actually ran. A issuer who runs a lenient policy
+and records it honestly gets a certificate that honestly reflects a
+lenient policy. The fix removes the ability to claim one policy and have
+run another; it does not make the claimed policy strict.
+
+**Erratum D20 (2026-09-20, the replay itself was unscoped — D19's class,
+found one layer deeper):** D19 reconciled the cert against the ledger, but
+the reconciliation only matters if the *replay* reads the same ledger the
+anchor pins. It did not. Three queries fed the replay — `claim.registered`,
+`evidence.recorded` (twice) — and all three scanned the whole ledger,
+while the analogous D4 guard on `deliberation.rounded` already restricted
+itself to the anchored prefix. Same class as D19, same fix, one layer down.
+
+The shape is worth recording because the first PoC attempt against it
+*failed*, and the reason it failed is the reason the bug is real. The
+ladder gives W1a machine evidence absolute priority over W2 jury
+opinion, so injecting a post-issuance W2 SUPPORTS item cannot move a
+verdict — the ladder is already robust there. What *does* move is a W1a
+item: a claim the honest run adjudicated INCONCLUSIVE (no evidence) can
+be flipped to VERIFIED by appending a `TEST_EXECUTION` SUPPORTS entry
+after the checkpoint. Measured: without the scope guard, replay recomputes
+VERIFIED over a cert that says INCONCLUSIVE, and verification rejects on
+the mismatch (detection, not prevention — and a cooperating issuer who
+ships the cert with the forged verdict gets silent acceptance).
+
+§9.5 now scopes every replay query to the anchored prefix
+(`seq <= checkpoint_seq`), the same boundary D4 uses. The verifier sees
+exactly the in-prefix state the signed anchor pins; post-issuance entries
+are invisible to it in either direction — they can neither rescue an
+unattested cert (D19) nor flip a verdict (D20). The `key.enrolled` lookup
+needs no guard: `next()` takes the first matching entry and the ledger is
+append-only, so the issuer's enrollment always precedes an attacker's
+duplicate.
+
+**Erratum D21 (2026-09-21, the formal core silently described the
+pre-D14 ladder — a fix that shipped without the thing that proves it):**
+e345259 changed ladder behavior (erratum D14: a W1b SUPPORT now survives
+doctrinal dissent in R4) but the truth table that re-checks the Lean model
+against all 28080 recorded cases was not regenerated, so the shipped
+`TruthTable.lean` described the pre-D14 ladder. Two defects compounded:
+
+1. `adjudicateCore` had no `w1bSup` flag, so the model could not express
+   the D14 rule at all — one row of 28080 disagreed.
+2. Five general theorems (I2, I4, I5, I6, I7, I10) called the old arity
+   and would not typecheck; Lean discharged them through `sorryAx`, listed
+   plainly in `#print axioms agree`:
+
+       'agree' depends on axioms: [propext, sorryAx, Classical.choice, ...]
+
+   so the agreement of the formal core with the reference implementation
+   was itself *unproven* while every build reported success. The
+   truth-table `native_decide` still caught it — as "is false", with no
+   location — because it does not route through the sorry.
+
+This is the failure mode the formal layer exists to catch, and it did its
+job; the missing step was wiring the regeneration into the commit that
+changed the ladder. §9.5's receipts now state the requirement operationally:
+any commit that changes `veridict/ladder.py` MUST regenerate both
+`docs/receipts-ladder-verification.json` (`python3 scripts/verify_ladder.py`)
+and `proofs/ladder/TruthTable.lean` (`scripts/export_lean_truth_table.py`),
+and a Lean build that reports success MUST still be inspected for `sorryAx`
+in its axiom list — success is not proof. After the fix: `w1bSup` added,
+all call sites updated, `sorryAx` gone from the axiom list, all 28080 rows
+checked. One row differs from the pre-D14 table, which is exactly the D14
+change and the table's reason for existing.

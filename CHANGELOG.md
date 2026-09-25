@@ -3,8 +3,180 @@
 Semver applies to the LEDGER FORMAT and the standard (§14): changes to a
 digest preimage, a payload schema, or a tier rule are MAJOR.
 
-## Unreleased (post-0.3.3 hygiene, on `main`, riding the `v1` tag)
+## Unreleased
 
+- **canary(L2-4):** `command-injection` defect class — `shell=True` over raw
+  input, the classic class generated code introduces. Offline-harness
+  artifact (a `local:` stand-in, no process ever spawned) whose own test
+  passes, so the defect is invisible to W1a and visible only in source —
+  the corpus's design constraint. 23 catches / 3 honest misses / 0 false
+  positives across 26 classes; counts updated in `tests/test_canary.py`,
+  `ci.yml`, and the README table.
+
+- **vectors(settlement):** `docs/standard-test-vectors/settlement/` — the
+  conformance vector for the *claims* surface a payment layer consumes,
+  built deterministically from the existing certificate vector by
+  `scripts/build_settlement_vectors.py` (no keys, clock, or network) and
+  pinned by `tests/test_settlement_vectors.py`. Four tamper cases each pin a
+  distinct rejection class (stale digest, reforged verdict, wrong
+  certificate, inflated coverage), and one test recomputes `claim_digest`
+  with stdlib only, so an independent payer can check claim integrity
+  without importing veridict. Cross-repo continuity: a bridge consumer in
+  another repo can pin this directory and detect drift in its own CI
+  instead of depending on the producer's pipeline alone.
+
+- **proofs(ledger):** `proofs/ledger/Chain.lean` — hash-chaining
+  tamper-evidence for `verify_chain`, machine-checked over chains of
+  *arbitrary* length: C1 empty-verifies (axiom-free), C2 wellformed-accepted
+  (no valid ledger ever rejected), C3 prefix-closed, C4 payload-edit
+  detected, C5 honest-remint detected modulo ONE stated collision
+  hypothesis, C6 genesis-rooted. Structural induction only — no `decide`,
+  no oracle needed, so no truth table by design; measured axiom footprint
+  `[propext]`-maximal (C1: none), disclosed in the header and re-printed on
+  every `proofs.yml` run (now three lanes: ladder, oracle, chain).
+  Issue #8 remainder narrowed to anchor verification (ECDSA — computational
+  assumption, out of structural model by honest design).
+- **proofs(anchor):** `proofs/anchor/Anchor.lean` — the structural layer of
+  certificate⇄CT-anchor cross-verification (`veridict/anchor.py`),
+  machine-checked: A0 fail-closed parsing, A1 binding-necessary, A2
+  no-silent-skip, A3/A3b honest sidecar accepted (certificate-bound and
+  crypto-only paths), **A4 signatures-cannot-rescue-a-wrong-binding** (the
+  headline: with the binding mismatched, invalid verdict is unconditional
+  regardless of both ECDSA booleans — a compromised log operator signing
+  valid signatures over the wrong anchor still fails `veridict verify`),
+  A5 tree-containment, A6 note/proof root agreement, A7 uuid-embeds-leaf.
+  ECDSA enters as a disclosed opaque boolean — the computational
+  assumption is named, not faked; all nine theorems measure `[propext]`
+  only (no `sorry`, no `native_decide`), audited as the fourth lane of
+  `proofs.yml`. Issue #8 remainder is now only the cryptographic layer
+  itself (ECDSA soundness + SHA-256/JSON instantiation) — out of
+  structural reach by design, honest TCB.
+
+## 0.5.0 — 2026-09-15 (machine-checked ladder, SPDX interop, Marketplace hardening)
+
+The formal layer shipped (Lean proofs over arbitrary evidence + a CI re-check
+against the full bounded receipt), SPDX 3.0.1 export validated against the
+pinned official schema, the action's input surfaces de-drifted and now
+e2e-tested through the public `uses: ./` path, and one real jury credential
+bug fixed in the open. Ledger format, payload schemas, and tier rules:
+unchanged — verification got louder, bytes stayed put.
+
+- action: `anchor` + `anchor-required` inputs on BOTH invocation surfaces
+  (composite + reusable workflow), with the offline-verify step consuming
+  the sidecar when present; closes the `actor-family` reusable-workflow
+  parity gap it also uncovered. New `tests/test_action_surface.py` pins
+  the input-SET equality so surfaces can no longer drift silently.
+- ci: `action-e2e.yml` runs the repo through its own public action surface
+  (`uses: ./` — exactly what Marketplace serves) on every release tag,
+  anchoring the receipt in Rekor; first dispatch caught a real bug (missing
+  caller checkout), first green proved input→CLI→log→verify wiring
+  end-to-end (logIndex 2844439400).
+- ci(test-deps): pyyaml added to the test install line (maintainer/CI
+  environment skew caught red-handed by CI, not by narrative).
+- repo: GitHub topics set (evidence-ledger, llm-as-a-judge, slsa,
+  transparency-log, …); adoption thread updated for 0.4.0 surfaces;
+  `v1` re-pointed to include the anchor inputs.
+- discovery: PR open against ProjectRecon/awesome-ai-agents-security (#123).
+- proofs: the adjudication ladder is machine-checked in Lean (`proofs/ladder/`,
+  core-only, no mathlib): seven invariants over evidence lists of ARBITRARY
+  length (fail-safe-empty, no-silent-pass, W1a-decisive, doctrine-cannot-
+  topple, escalated-conditions, split-stays-visible, meta-budget-honored, +
+  divergence coherence) and a generated oracle re-checking the model against
+  ALL 28,080 bounded-receipt cases at build time (digest-tied to ladder.py
+  and the receipt's table sha256; `native_decide` trust placement disclosed,
+  general theorems never use it). The oracle's first run caught a genuine
+  model/implementation divergence (R0's refute-anywhere guard) — the MODEL
+  moved, the data did not. `proofs.yml` kernel-checks on every ladder touch.
+- export: `--format spdx` emits an SPDX 3.0.1 AI-profile JSON-LD document
+  validated against the official schema (pinned under `docs/data/`, sha256
+  locked in tests). Honest envelope: audited artifact as `ai_AIPackage`,
+  every audit semantic as core Annotation/Relationship/ExternalRef; no ai_*
+  field carries a meaning SPDX doesn't give it (test locks the refusal to
+  map risk_level into ai_safetyRiskAssessment). Deterministic — timestamps
+  are ledger-issuance, not export-time. `--anchor-file` embeds the Rekor
+  receipt as an ExternalRef.
+- docs: §10.5 competitive landscape re-scanned with dated primary sources
+  (HANSARD 2608.22512, VCT 2606.23003, IET 2603.17445, MedAgentAudit
+  2510.10185, the judge-calibration cluster, microsoft/agent-governance-
+  toolkit runtime-vs-posthoc positioning); an unverifiable "AegisChain"
+  entry circulating in secondary surveys dropped after source hunt —
+  surveys are not oracles. Regulatory lines refreshed (Art. 50 + GPAI
+  enforcement live 2026-08-02; Omnibus legacy-marking grace 2026-12-02),
+  mirrored in the aiact watcher docstring and re-exported manifests.
+- fix(cli): `veridict --version`; and a real one — the VSA/SPDX version
+  probe queried `importlib.metadata("veridict")` while the distribution is
+  `veridict-standard` (bare name belongs to another project), so every
+  installed-wheel VSA mislabeled its verifier "0.3.3+source". Both names
+  probed now; the drift was caught by the 0.5.0 first-run UX walkthrough.
+- corrections: an earlier sweep commit claimed "316 tests"; the suite was
+  306 (313 now, with the SPDX additions). Receipts amended forward rather
+  than rewriting pushed history.
+
+## 0.4.0 — 2026-09-15 (research-grounded gap closure: calibrated jury, external anchoring, SLSA export, ladder proofs)
+
+Research-grounded gap closure: every item below traces to the 2026-09-14
+literature/regulatory sweep (jury-bias papers, AuditWeave, SLSA v1.2, EU
+AI Act GPAI Code of Practice, patent watch) — the roadmap's "current data"
+deficit, closed autonomously, receipts-first.
+
+### Protocol & engine
+
+- **jury calibration layer** — the three documented LLM-as-judge failure
+  modes now have structural mitigations shipping in the reference jury
+  (Zheng et al. arXiv:2306.05685, Wang et al. arXiv:2305.17926, Watai et
+  al. arXiv:2410.21819 cited in-module): multi-sample self-consistency
+  voting (`VERIDICT_JURY_SAMPLES`, temperature 0.7 for n>1, majority or
+  honest abstention — a sample-split can never fabricate a stance),
+  evidence-first extraction (verdict without ≥2 evidence pointers is
+  flagged, not silently trusted), and **self-preference exclusion**
+  (jurors of the audited actor's provider family abstain before the
+  jury is validated; `VERIDICT_ACTOR_FAMILY` / new `actor-family` action
+  input). Real-jury CI receipt now runs 3 samples.
+- **external anchoring** (`veridict/anchor.py`) — the design doc's
+  checkpoint-hardening promise, kept: `audit --anchor rekor` /
+  `anchor publish` pins {cert_id, key_id, checkpoint_seq, chain_hash}
+  to the Sigstore Rekor public-good log; `verify --anchor` checks
+  existence-at-time fully offline against the pinned Rekor key
+  (TUF-hash-verified; rotation fails CLOSED with a documented recipe).
+  Existence proof, not authority transfer — the ephemeral anchor key is
+  by design. v1 release's dogfood cert is anchored live
+  (`docs/receipts-anchor-v1-dogfood.json`, logIndex 2843194981).
+- **SLSA v1.2 VSA export** (`veridict export --format vsa`) — lossy,
+  honest projection (PASSED only for risk=low; `verifiedLevels` empty —
+  Veridict asserts no build level; `timeVerified` from the ledger's
+  issuance entry; cert named by digest in `inputAttestations`; full
+  binding as a spec-sanctioned URI extension). Optional DSSE envelope
+  under the issuing key.
+- **ladder bounded-exhaustive verification** (`scripts/verify_ladder.py`)
+  — 28,080 cases covering the complete finite input space (evidence
+  sequences ≤3 × tiers × stances × claim/policy dimensions), 10 safety
+  invariants PASS incl. no-silent-pass, W1a-decisiveness, doctrine-
+  cannot-topple, split-visibility; determinism double-checked per case.
+  Receipt `docs/receipts-ladder-verification.json`; CI locks the truth-
+  table digest, and a meta-test proves the invariants see an injected
+  silent-pass bug. Issue #8 annotated (general proofs remain open).
+
+### Ecosystem
+
+- **11th example watcher: EU AI Act transparency**
+  (`watchers/aiact_watcher.py`) — deterministic Art. 50 / GPAI CoP
+  checks (disclosure anchor, `ai_outputs/` provenance sidecars,
+  training-data summary for shipped weights); vacuous-SUPPORTS for
+  non-AI repos; conformance-kit clean; manifest example shipped.
+- **governance**: IP & prior-art watch section — US App 19/561,229
+  overlap assessed against RFC 6962 + AuditWeave intervening art and
+  our dated public record; defensive publication named as doctrine
+  (anchored receipts as a side effect of operating). Not legal advice.
+- **design doc §10.5**: AuditWeave (arXiv:2607.09682) positioned as
+  closest neighbor — convergent validation of the ledger primitive and
+  of mutation-testing doctrine; differentiation: adjudication-vs-
+  recording, protocol-vs-tool. Niche paragraph updated honestly.
+
+### Housekeeping
+
+- tests: 260 → **297** (anchor 9, export 7, aiact 8, ladder 2, jury 16 —
+  incl. tamper/meta/refusal cases throughout); ledger format untouched —
+  every change additive-minor per §14.
 - marketplace: **listing published** (2026-09-14) —
   https://github.com/marketplace/actions/veridict-audit, primary category
   **Security**. Lane 0 is fully closed; the only remaining work is external

@@ -20,7 +20,30 @@ def _audit_fn():
                  "read_config closes the file handle it opens",
                  "find_user never interpolates raw input into SQL",
                  "parse_strict never ignores malformed input",
-                 "no hardcoded credentials are present"}
+                 "no hardcoded credentials are present",
+                 # L2-2 security expansion (2026-09-16): 7 new defect classes.
+                 # Intent lines are the MACHINE evidence the audit_fn must
+                 # refute; each ships with its own artifact + test.
+                 "parse_count clamps to the documented 1..1000 range",
+                 "read_report rejects names that escape base_dir",
+                 "load_profile rejects pickle on untrusted input",
+                 "safe_compare is constant-time (no short-circuit)",
+                 "make_token uses a cryptographically secure generator",
+                 "get_cached closes the check-then-use race",
+                 "login failure paths return one indistinguishable reason",
+                 # L2-3 security expansion (2026-09-19): 5 more defect classes.
+                 # Same contract: the intent line is the MACHINE claim the
+                 # audit must refute; the artifact ships the seeded defect.
+                 "fetch_thumbnail only reaches allowlisted hosts",
+                 "render_greeting escapes the name before embedding it",
+                 "login_redirect only allows same-origin targets",
+                 "update never writes privileged fields from caller input",
+                 "authorize checks a key held outside the source tree",
+                 # L2-4 security expansion (2026-09-21): command injection —
+                 # the classic LLM-introduced class (shell=True over raw
+                 # input). Same contract: the intent line is the MACHINE
+                 # claim the audit must refute.
+                 "run_report_tool never passes raw input to a shell"}
     # deliberately NOT refutable: hash_password (crypto-misuse honest miss),
     # parse_iso_utc (offset-stomp honest miss), and both clean summaries
     overrides = {
@@ -55,6 +78,22 @@ def test_quality_sheet_counts_catches_and_false_positives():
     assert by_id["canary-crypto-misuse"] is False                # honest miss
     assert by_id["canary-clean-uuid"] is False                   # no false positive
     assert by_id["canary-secrets-leak"] is True
+    # L2-2 security expansion — all 7 new classes are caught
+    assert by_id["canary-integer-overflow"] is True
+    assert by_id["canary-path-traversal"] is True
+    assert by_id["canary-insecure-deserialization"] is True
+    assert by_id["canary-timing-attack"] is True
+    assert by_id["canary-weak-random"] is True
+    assert by_id["canary-toctou"] is True
+    assert by_id["canary-error-message-leak"] is True
+    # L2-3 security expansion (2026-09-19) — all 5 new classes are caught
+    assert by_id["canary-ssrf"] is True
+    assert by_id["canary-xss-output"] is True
+    assert by_id["canary-open-redirect"] is True
+    assert by_id["canary-mass-assignment"] is True
+    assert by_id["canary-hardcoded-credentials"] is True
+    # L2-4 security expansion (2026-09-21) — the classic LLM-introduced class
+    assert by_id["canary-command-injection"] is True
     assert sheet["per_class"]["uncovered-edge"] == {"caught": 1, "total": 2}
     assert sheet["per_class"]["logic-error"] == {"caught": 1, "total": 1}
     assert sheet["per_class"]["contract-violation"] == {"caught": 1, "total": 1}
@@ -64,11 +103,24 @@ def test_quality_sheet_counts_catches_and_false_positives():
     assert sheet["per_class"]["race-condition"] == {"caught": 1, "total": 1}
     assert sheet["per_class"]["crypto-misuse"] == {"caught": 0, "total": 1}
     assert sheet["per_class"]["secrets-leak"] == {"caught": 1, "total": 1}
-    assert sheet["caught_total"] == 10
+    assert sheet["per_class"]["integer-overflow"] == {"caught": 1, "total": 1}
+    assert sheet["per_class"]["path-traversal"] == {"caught": 1, "total": 1}
+    assert sheet["per_class"]["insecure-deserialization"] == {"caught": 1, "total": 1}
+    assert sheet["per_class"]["timing-attack"] == {"caught": 1, "total": 1}
+    assert sheet["per_class"]["weak-random"] == {"caught": 1, "total": 1}
+    assert sheet["per_class"]["toctou"] == {"caught": 1, "total": 1}
+    assert sheet["per_class"]["error-message-leak"] == {"caught": 1, "total": 1}
+    assert sheet["per_class"]["ssrf"] == {"caught": 1, "total": 1}
+    assert sheet["per_class"]["xss-output"] == {"caught": 1, "total": 1}
+    assert sheet["per_class"]["open-redirect"] == {"caught": 1, "total": 1}
+    assert sheet["per_class"]["mass-assignment"] == {"caught": 1, "total": 1}
+    assert sheet["per_class"]["hardcoded-credentials"] == {"caught": 1, "total": 1}
+    assert sheet["per_class"]["command-injection"] == {"caught": 1, "total": 1}
+    assert sheet["caught_total"] == 23
 
 
 def test_quality_sheet_persists(tmp_path):
     sheet = CanaryRunner(_audit_fn()).run("corpus/corpus.jsonl")
     out = tmp_path / "sheet.json"
     out.write_text(json.dumps(sheet))
-    assert json.loads(out.read_text())["caught_total"] == 10
+    assert json.loads(out.read_text())["caught_total"] == 23

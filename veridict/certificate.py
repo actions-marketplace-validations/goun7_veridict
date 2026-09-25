@@ -11,7 +11,7 @@ from .ladder import adjudicate
 from .ledger import ChainError, Ledger
 from .policy import PolicyDeclaration, Thresholds
 from .schemas import ActorRef, Claim, EvidenceItem, SCHEMA_VERSION
-from .utils import canonical_json, sha256_hex
+from .utils import canonical_json, payload_digest, sha256_hex
 
 ADJUDICATOR = ActorRef(kind="adjudicator", identity="veridict-issuer", version="0.1.0")
 
@@ -22,6 +22,27 @@ def _risk_level(values: list[str]) -> str:
     if any(v == "INCONCLUSIVE" for v in values):
         return "medium"
     return "low"
+
+
+def _risk_level_for(claims: list[Claim], per_claim: dict) -> str:
+    """Risk reflects TOP-LEVEL claim verdicts only.
+
+    A REFUTED coverage meta-claim is a juror declining to answer a question
+    the ladder asked because that juror had already dissented — it carries
+    no independent finding about the artifact. Counting it as high risk
+    would let the same dissent §5.3 rule 2 refuses to honor at the gate come
+    back in through the certificate's risk field. Meta-claim refusals are
+    surfaced as `meta-coverage-unconfirmed` flags in the certificate; risk
+    stays tied to claims about the artifact itself.
+    """
+    top = [c for c in claims
+           if c.verifiability != "DOCTRINAL"
+           or not c.predicate.startswith("coverage-of-")]
+    values = []
+    for c in top:
+        a = per_claim[c.claim_id]
+        values.append(a["value"] if isinstance(a, dict) else a.value)
+    return _risk_level(values)
 
 
 class CertificateIssuer:
@@ -50,6 +71,7 @@ class CertificateIssuer:
                                "min_w1_coverage": policy.thresholds.min_w1_coverage,
                                "meta_claim_depth_budget": policy.thresholds.meta_claim_depth_budget}},
             "claims": [{"claim_id": c.claim_id,
+                        "predicate": c.predicate,
                         "verdict_value": adj_by_id[c.claim_id].value,
                         "divergence": adj_by_id[c.claim_id].divergence,
                         "evidence_ids": [e.evidence_id
@@ -59,7 +81,7 @@ class CertificateIssuer:
             "disclosure_level": disclosure_level,
             "divergence_summary": {c.claim_id: adj_by_id[c.claim_id].divergence
                                    for c in claims},
-            "risk_level": _risk_level([adj_by_id[c.claim_id].value for c in claims]),
+            "risk_level": _risk_level_for(claims, adj_by_id),
             "score": round(sum(1 for c in claims
                                if adj_by_id[c.claim_id].value == "VERIFIED")
                            / len(claims), 3) if claims else 0.0,
@@ -99,13 +121,23 @@ def verify_certificate(ledger_path: str, cert_path: str) -> dict:
         errors.append(f"chain: {chain_msg}")
 
     # Signature over the unsigned body, verified against the enrolled key.
+    # The key.enrolled lookup is scoped to the anchored prefix (seq <= cp_seq):
+    # a key enrolled AFTER the checkpoint can re-sign an unchanged body and
+    # would otherwise produce signature_valid=true, and a relying party cannot
+    # tell an issuer-time signature from a later rogue key's. Append-only means
+    # next() still takes the original enrollment for an honest key; the guard
+    # only forbids time travel.
     body = dict(cert)
     sigs = body.pop("signatures", [])
+    anchor = cert.get("ledger_anchor", {})
+    cp_seq_raw = anchor.get("checkpoint_seq")
+    cp_seq = cp_seq_raw if isinstance(cp_seq_raw, int) else None
     sig_ok = False
     for s in sigs:
         pub_pem = next((e["payload"]["public_pem"]
                         for e in led.query("key.enrolled")
-                        if e["payload"]["key_id"] == s["key_id"]), None)
+                        if e["payload"]["key_id"] == s["key_id"]
+                        and (cp_seq is None or e["seq"] <= cp_seq)), None)
         if pub_pem and KeyStore.verify_signature(
                 pub_pem, canonical_json(body).encode("utf-8"), s["sig_b64"]):
             sig_ok = True
@@ -114,11 +146,26 @@ def verify_certificate(ledger_path: str, cert_path: str) -> dict:
         errors.append("signature: no enrolled key verifies the certificate body")
 
     # Anchor check: the checkpoint entry must exist and match the cert anchor.
+    # The pinned chain_hash is compared against the REAL chain, not the
+    # checkpoint entry's self-attested payload. Comparing payload to payload
+    # is a no-op when an attacker with ledger write access rewrites the pinned
+    # prefix and recomputes every hash — the checkpoint's stored chain_hash is
+    # just more attacker-controlled bytes in the same file. The entry at
+    # cp_seq - 1 is the last entry the checkpoint covered, and its recomputed
+    # entry_hash IS the chain_hash a honest issue() pinned (certificate.py:97
+    # sets chain_hash = entries[-1].entry_hash at append time). Binding it here
+    # makes the prefix tamper-evident rather than tamper-visible.
     anchor = cert.get("ledger_anchor", {})
     cp_seq = anchor.get("checkpoint_seq")
-    if not isinstance(cp_seq, int) or cp_seq >= len(led.entries) or \
-            led.entries[cp_seq]["entry_type"] != "checkpoint.anchored" or \
-            led.entries[cp_seq]["payload"]["chain_hash"] != anchor.get("chain_hash"):
+    anchor_ok = False
+    if isinstance(cp_seq, int) and cp_seq >= 1 and cp_seq < len(led.entries):
+        if led.entries[cp_seq]["entry_type"] == "checkpoint.anchored":
+            prev_hash = led.entries[cp_seq - 1]["entry_hash"]
+            anchor_ok = (
+                prev_hash == anchor.get("chain_hash")
+                and led.entries[cp_seq]["payload"].get("chain_hash")
+                == anchor.get("chain_hash"))
+    if not anchor_ok:
         errors.append("anchor: checkpoint does not match ledger")
 
     # Issuance check: the ledger must contain the certificate.issued entry the
@@ -142,10 +189,69 @@ def verify_certificate(ledger_path: str, cert_path: str) -> dict:
             mode=pr.get("mode", "CERTIFICATE"),
             criticality=tuple(pr.get("criticality", [])),
             thresholds=Thresholds(**pr.get("thresholds", {})),
-            divergence_tolerance=pr.get("thresholds", {}).get(
-                "divergence_tolerance", 1 / 3))
+            # divergence_tolerance is a PolicyDeclaration field (audit F5):
+            # asdict serializes it at policy_ref top level, so read it there
+            # first and fall back to under-thresholds for pre-F5 certs.
+            divergence_tolerance=pr.get(
+                "divergence_tolerance", pr.get("thresholds", {}).get(
+                    "divergence_tolerance", 1 / 3)))
+        # Policy provenance (D17 class, members four and five). The cert's
+        # `policy_ref` is used to BUILD the replay policy, so unlike a
+        # summary field it is an INPUT to the verdicts, not a consequence of
+        # them: a verifier reading the policy from the certificate replays
+        # under whatever policy the issuer claims to have used. The ledger
+        # records the policy the run actually used — policy.decision carries
+        # policy_digest — so policy_ref is reconciled against it rather than
+        # trusted. If no recorded policy matches the claimed policy_id, the
+        # claim is unfalsifiable and the replay would run under an
+        # unattested policy; that must fail closed, not skip the check.
+        # Scope guard (D4, same as deliberation below): only a policy.decision
+        # INSIDE the anchored prefix (seq <= checkpoint) attests the policy
+        # the run used. The cert's signed anchor pins that prefix's
+        # chain_hash; a post-issuance entry is outside it, so an attacker
+        # cannot retroactively attest a policy that was never run — and
+        # equally cannot append a mismatched entry to engineer a spurious
+        # rejection. Taking the LAST in-prefix match keeps the run's own
+        # decision when a policy_id legitimately appears twice (e.g. a
+        # blocked-then-passed retry under the same declaration). When the
+        # anchor itself is bad the anchor check above already rejects, so
+        # this guard only narrows the view of an otherwise-anchored prefix.
+        in_prefix = (lambda e: isinstance(cp_seq, int) and e["seq"] <= cp_seq)
+        recorded = next((e["payload"] for e in reversed(led.query("policy.decision"))
+                         if in_prefix(e)
+                         and e["payload"].get("policy_id") == pol.policy_id), None)
+        if recorded is None:
+            errors.append("policy: cert policy_ref names a policy_id the "
+                          "ledger does not record — replay would adjudicate "
+                          "under an unattested policy")
+            verdicts_match = False
+        elif recorded.get("policy_digest") != payload_digest(pol.to_dict()):
+            errors.append("policy mismatch: cert policy_ref does not match "
+                          "the policy the ledger records the run used — "
+                          "replay would adjudicate under the issuer's "
+                          "claimed policy, not the real one")
+            verdicts_match = False
+        if cert.get("policy_mode") != pr.get("mode"):
+            errors.append(f"policy_mode mismatch: cert={cert.get('policy_mode')}"
+                          f" policy_ref.mode={pr.get('mode')} — the mode is "
+                          f"stored twice and the two copies disagree")
+            verdicts_match = False
+        # Replay scope (D20): every entry the replay trusts must come from
+        # INSIDE the anchored prefix (seq <= checkpoint). The cert's signed
+        # anchor pins that prefix's chain_hash, so pre-issuance entries are
+        # tamper-evident; a post-issuance entry is outside the pin and must
+        # not reach the replay. Measured before this fix: an attacker with
+        # ledger write access appends either (a) a claim.registered with a
+        # claim_id the cert already names — the dict comprehension below
+        # OVERWRITES the real claim with the attacker's text while the cert
+        # still verifies valid — or (b) an evidence.recorded SUPPORTS item,
+        # which flips a refuted/inconclusive verdict to VERIFIED. Both are
+        # the same class as the D19 policy.decision gap: an unscoped query.
+        # cp_seq is int-checked by the anchor gate above; when it is not,
+        # the cert is already rejected, so this only narrows a good anchor.
+        in_prefix = (lambda e: isinstance(cp_seq, int) and e["seq"] <= cp_seq)
         claims_by_id = {e["payload"]["claim_id"]: Claim.from_dict(e["payload"])
-                        for e in led.query("claim.registered")}
+                        for e in led.query("claim.registered") if in_prefix(e)}
         ev_by_claim: dict[str, list[EvidenceItem]] = {}
         # Deliberation parity (§4.4.3): when a claim went through a revision
         # round, the deliberation.rounded entry names the SUPERSEDED first-round
@@ -164,12 +270,12 @@ def verify_certificate(ledger_path: str, cert_path: str) -> dict:
                 superseded.update(x["evidence_id"]
                                   for x in e["payload"].get("first_round", []))
         for e in led.query("evidence.recorded"):
-            if e["payload"]["evidence_id"] in superseded:
+            if not in_prefix(e) or e["payload"]["evidence_id"] in superseded:
                 continue
             ev_by_claim.setdefault(e["payload"]["claim_id"], []).append(
                 EvidenceItem.from_dict(e["payload"]))
         known_evidence_ids = {e["payload"]["evidence_id"]
-                              for e in led.query("evidence.recorded")}
+                              for e in led.query("evidence.recorded") if in_prefix(e)}
         for c in cert["claims"]:
             claim = claims_by_id.get(c["claim_id"])
             if claim is None:
@@ -190,5 +296,52 @@ def verify_certificate(ledger_path: str, cert_path: str) -> dict:
                 errors.append(f"verdict mismatch for {c['claim_id']}: "
                               f"cert={c['verdict_value']} recomputed={recomputed.value}")
                 verdicts_match = False
+        # Derived-field consistency (Tamga ERRATUM-A2 class): a certificate
+        # carries summary fields that FOLLOW from the verdicts — risk_level
+        # and score. The verdicts themselves are recomputed above, so they
+        # cannot be lied about. But a verifier that stops at the verdicts
+        # leaves the summaries unconstrained: an attacker who cannot touch
+        # the verdicts can still rewrite risk_level to 'low' while a claim
+        # verdict says REFUTED, hiding a bad result behind a green summary —
+        # or to 'high' while verdicts say VERIFIED, inflating it. A consumer
+        # that reads risk_level to decide (the settlement policy does exactly
+        # this) would then decide on a forged field.
+        #
+        # Scope: only the claims THIS certificate adjudicates. A shared ledger
+        # carries claims from other audits (segments, other tasks); scoring
+        # those would measure the ledger, not the certificate.
+        cert_claims = [claims_by_id[c["claim_id"]] for c in cert["claims"]
+                       if c["claim_id"] in claims_by_id]
+        replay = {c.claim_id: adjudicate(c, ev_by_claim.get(c.claim_id, []), pol)
+                  for c in cert_claims}
+        recomputed_risk = _risk_level_for(cert_claims, replay)
+        if cert.get("risk_level") != recomputed_risk:
+            errors.append(f"risk_level mismatch: cert={cert.get('risk_level')} "
+                          f"recomputed={recomputed_risk} — summary field does "
+                          f"not follow from the claim verdicts")
+            verdicts_match = False
+        n = len(cert_claims)
+        recomputed_score = round(sum(1 for a in replay.values()
+                                     if a.value == "VERIFIED") / n, 3) if n else 0.0
+        if cert.get("score") != recomputed_score:
+            errors.append(f"score mismatch: cert={cert.get('score')} "
+                          f"recomputed={recomputed_score} — does not follow "
+                          f"from the claim verdicts")
+            verdicts_match = False
+        # Same class, second member: `divergence_summary` maps each claim to
+        # its adjudication divergence (UNANIMOUS / SPLIT / ...). It is a
+        # per-claim summary that follows from the same replay, and a verifier
+        # that checks only the verdict value leaves it unconstrained. Forging
+        # it cannot manufacture a REFUTED verdict — the verdict check above
+        # still fires — but it can hide a SPLIT the same way risk_level can
+        # hide a high one, which matters because a SPLIT is the trigger for
+        # deliberation (§9.1) and the honest disagreement the certificate
+        # exists to surface. Forging jury_composition is the third member:
+        # a certificate whose real panel was one family can claim two.
+        recomputed_div = {cid: a.divergence for cid, a in replay.items()}
+        if cert.get("divergence_summary") != recomputed_div:
+            errors.append("divergence_summary mismatch — does not follow from "
+                          "the claim adjudications")
+            verdicts_match = False
     return {"valid": not errors, "chain_valid": chain_ok, "signature_valid": sig_ok,
             "verdicts_match": verdicts_match, "errors": errors}

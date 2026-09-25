@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import sys
 
+from . import anchor
 from .audit import AuditOrchestrator
 from .certificate import verify_certificate
 from .dossier import dossier_for, render_markdown, resolve_dossier
@@ -38,7 +40,9 @@ def _build_jury() -> tuple[Jury, list[str]]:
     if os.environ.get("VERIDICT_JURY_URL2"):
         providers.append(OpenAICompatProvider(
             family="openai-compat-2", identity="http-2",
-            base_url=os.environ["VERIDICT_JURY_URL2"]))
+            base_url=os.environ["VERIDICT_JURY_URL2"],
+            api_key=os.environ.get("VERIDICT_JURY_KEY2"),
+            model=os.environ.get("VERIDICT_JURY_MODEL2")))
     n = 0
     while len(providers) < 2:
         n += 1
@@ -46,7 +50,8 @@ def _build_jury() -> tuple[Jury, list[str]]:
                         "configure VERIDICT_JURY_URL[/URL2] for real doctrine")
         providers.append(ScriptedProvider(family=f"stub-{n}", identity=f"stub-{n}-1",
                                           default=Opinion("SUPPORTS", 0.8, "stub")))
-    return Jury(providers), warnings
+    return Jury(providers, author_family=os.environ.get("VERIDICT_ACTOR_FAMILY")
+                or None), warnings
 
 
 def _load_watchers(specs, ledger, keystore, key_id, warnings,
@@ -133,16 +138,115 @@ def _cmd_audit(args) -> int:
     ledger.save(args.ledger)
     with open(args.cert_out, "w", encoding="utf-8") as f:
         json.dump(result["cert"], f, indent=2, sort_keys=True)
+    anchor_info = None
+    if getattr(args, "anchor", "none") == "rekor":
+        from . import anchor as anchor_mod     # lazy: offline-first surface
+        target = args.anchor_out or (args.cert_out + ".anchor.json")
+        entries = [json.loads(l) for l in open(args.ledger, encoding="utf-8")
+                   if l.strip()]
+        try:
+            sidecar = anchor_mod.publish(entries, result["cert"],
+                                         rekor_url=args.rekor_url)
+            with open(target, "w", encoding="utf-8") as f:
+                json.dump(sidecar, f, indent=2, sort_keys=True)
+            anchor_info = {"out": target, "uuid": sidecar["rekor"]["uuid"],
+                           "logIndex": sidecar["rekor"]["entry"].get("logIndex")}
+        except Exception as exc:               # anchor is hardening, never a
+            anchor_info = {"error": str(exc)}  # silent-pass risk: it reports
+            if getattr(args, "anchor_required", False):
+                raise
     print(json.dumps({"report": result["report"],
                       "blocked": result["outcome"].blocked,
+                      "anchor": anchor_info,
                       "warnings": warnings}, indent=2))
     return 2 if result["outcome"].blocked else 0
 
 
 def _cmd_verify(args) -> int:
     report = verify_certificate(args.ledger, args.cert)
+    if getattr(args, "anchor", None):
+        from . import anchor as anchor_mod
+        with open(args.anchor, encoding="utf-8") as f:
+            sidecar = json.load(f)
+        with open(args.cert, encoding="utf-8") as f:
+            cert = json.load(f)
+        a_res = anchor_mod.verify(sidecar, cert)
+        report["anchor"] = a_res
+        report["valid"] = report["valid"] and a_res["valid"]
     print(json.dumps(report, indent=2))
     return 0 if report["valid"] else 1
+
+
+def _cmd_anchor(args) -> int:
+    from . import anchor as anchor_mod
+    with open(args.cert, encoding="utf-8") as f:
+        cert = json.load(f)
+    if args.action == "publish":
+        entries = [json.loads(l) for l in open(args.ledger, encoding="utf-8")
+                   if l.strip()]
+        sidecar = anchor_mod.publish(entries, cert, rekor_url=args.rekor_url)
+        text = json.dumps(sidecar, indent=2, sort_keys=True)
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as f:
+                f.write(text + "\n")
+        print(text)
+        return 0
+    with open(args.anchor, encoding="utf-8") as f:
+        sidecar = json.load(f)
+    res = anchor_mod.verify(sidecar, cert)
+    print(json.dumps(res, indent=2))
+    return 0 if res["valid"] else 1
+
+
+def _cmd_export(args) -> int:
+    from . import export as export_mod
+    with open(args.cert, encoding="utf-8") as f:
+        cert = json.load(f)
+    entries = [json.loads(l) for l in open(args.ledger, encoding="utf-8")
+               if l.strip()]
+    if args.format == "spdx":
+        if args.sign:
+            print("error: --sign produces a DSSE/in-toto envelope, which "
+                  "only wraps VSA statements; SPDX exports carry the "
+                  "certificate's own signatures — export the VSA to sign.",
+                  file=sys.stderr)
+            return 2
+        anchor = None
+        if args.anchor_file:
+            with open(args.anchor_file, encoding="utf-8") as f:
+                anchor = json.load(f)
+        doc = export_mod.to_spdx(cert, entries, anchor=anchor)
+        text = json.dumps(doc, indent=2, sort_keys=True)
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as f:
+                f.write(text + "\n")
+        print(text)
+        return 0
+    statement = export_mod.to_vsa(cert, entries)
+    doc = statement
+    if args.sign:
+        with open(args.sign, encoding="utf-8") as f:
+            pem = f.read()
+        # Accept BOTH shapes adopters actually have on disk: a raw PEM, or
+        # the JSON key file written by `registry init` (keys.export_key_file).
+        # In the JSON case its key_id is the default signer — a VSA signer
+        # need not be the certificate's issuer, but silently signing with a
+        # key whose id we had to invent would be worse than refusing.
+        key_hint = ""
+        if pem.lstrip().startswith("{"):
+            keydata = json.loads(pem)
+            pem = keydata["private_pem"]
+            key_hint = keydata.get("key_id", "")
+        key_id = args.key_id or key_hint or (cert.get("signatures") or [{}])[0].get(
+            "key_id", "")
+        doc = {"envelope": export_mod.dsse_envelope(statement, pem, key_id),
+               "statement": statement}
+    text = json.dumps(doc, indent=2, sort_keys=True)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+    print(text)
+    return 0
 
 
 def _cmd_quality_sheet(args) -> int:
@@ -202,6 +306,45 @@ def _cmd_index(args) -> int:
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(idx, f, indent=2, sort_keys=True)
     print(json.dumps(idx, indent=2))
+    return 0
+
+
+def _cmd_settle(args) -> int:
+    """Turn a verified certificate into a settlement claim, or reconcile one.
+
+    A payment layer cannot take an agent's word that work was done. This
+    emits a claim derived ONLY from certificate fields, then — when
+    --claim is given — reconciles the presented claim against the
+    certificate from scratch, so a tampered or inflated claim is caught
+    instead of paid. The certificate itself must already be verified;
+    this command never verifies it.
+    """
+    from .settlement import (SettlementPolicy, build_settlement_claim,
+                             verify_settlement_claim)
+    policy = SettlementPolicy(
+        max_risk=args.max_risk,
+        min_jury_families=args.min_jury_families,
+        min_claim_coverage=args.min_coverage,
+    )
+    with open(args.cert, encoding="utf-8") as f:
+        cert = json.load(f)
+    if args.claim:
+        with open(args.claim, encoding="utf-8") as f:
+            presented = json.load(f)
+        report = verify_settlement_claim(presented, cert, policy)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        # rc 1 = the claim does not hold: it is internally inconsistent
+        # (edited after issuance), does not follow from this certificate
+        # under this policy, or the certificate itself does not qualify.
+        # rc 0 only when the claim is valid — meaning the certificate was
+        # verified independently AND satisfies the settlement policy.
+        return 0 if report.get("valid", False) else 1
+    claim = build_settlement_claim(cert, policy)
+    payload = dataclasses.asdict(claim)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+    print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
 
 
@@ -298,6 +441,9 @@ def _cmd_watch(args) -> int:
 
 def main(argv=None) -> int:
     p = _Parser(prog="veridict")
+    from .export import _veridict_version
+    p.add_argument("--version", action="version",
+                   version=f"veridict {_veridict_version()}")
     sub = p.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("audit")
     a.add_argument("--task", required=True)
@@ -313,7 +459,43 @@ def main(argv=None) -> int:
                         "and ACTIVE there (§6.6); revocation is enforced")
     a.add_argument("--disclosure", default="REDACTED",
                    choices=("LOCAL_ONLY", "REDACTED", "FULL"))
+    a.add_argument("--anchor", choices=("none", "rekor"), default="none",
+                   help="pin the certificate's checkpoint to an external "
+                        "transparency log (Sigstore Rekor public-good)")
+    a.add_argument("--anchor-out",
+                   help="where to write the anchor sidecar JSON "
+                        "(default: <cert-out>.anchor.json)")
+    a.add_argument("--rekor-url", default=anchor.REKOR_SERVER)
+    a.add_argument("--anchor-required", action="store_true",
+                   help="fail the run if the anchor cannot be published "
+                        "(default: report the failure and keep the certificate)")
     a.set_defaults(func=_cmd_audit)
+    an = sub.add_parser("anchor")
+    an.add_argument("action", choices=("publish", "verify"))
+    an.add_argument("--ledger", required=True)
+    an.add_argument("--cert", required=True)
+    an.add_argument("--out", help="publish: write the sidecar here")
+    an.add_argument("--anchor", help="verify: the sidecar JSON to check")
+    an.add_argument("--rekor-url", default=anchor.REKOR_SERVER)
+    an.set_defaults(func=_cmd_anchor)
+    e = sub.add_parser("export")
+    e.add_argument("--format", choices=("vsa", "spdx"), required=True,
+                   help="vsa: SLSA v1.2 Verification Summary Attestation "
+                        "(in-toto Statement); spdx: SPDX 3.0.1 AI-profile "
+                        "JSON-LD document. Both lossy projections — the "
+                        "certificate stays authoritative)")
+    e.add_argument("--cert", required=True)
+    e.add_argument("--ledger", required=True)
+    e.add_argument("--anchor-file", metavar="SIDECAR",
+                   help="with --format spdx: embed the anchoring receipt "
+                        "(written by audit --anchor-out) as an ExternalRef")
+    e.add_argument("--out")
+    e.add_argument("--sign", metavar="KEYFILE",
+                   help="wrap in a DSSE envelope signed with this Ed25519 "
+                        "PEM private key (default: unsigned statement)")
+    e.add_argument("--key-id", help="keyid for the DSSE signature "
+                                     "(default: the certificate's signer key)")
+    e.set_defaults(func=_cmd_export)
     r = sub.add_parser("registry")
     r.add_argument("action", choices=("init", "register", "revoke", "list", "index"))
     r.add_argument("--registry", required=True)
@@ -328,6 +510,8 @@ def main(argv=None) -> int:
     v = sub.add_parser("verify")
     v.add_argument("--ledger", required=True)
     v.add_argument("--cert", required=True)
+    v.add_argument("--anchor", help="also verify an external anchor sidecar "
+                                    "(transparency-log receipt) against the cert")
     v.set_defaults(func=_cmd_verify)
     q = sub.add_parser("quality-sheet")
     q.add_argument("--corpus", required=True)
@@ -350,6 +534,24 @@ def main(argv=None) -> int:
     idx.add_argument("--out")
     idx.add_argument("--validate", action="store_true")
     idx.set_defaults(func=_cmd_index)
+    st = sub.add_parser(
+        "settle",
+        help="derive a settlement claim from a verified certificate, or "
+             "reconcile a presented claim against its certificate")
+    st.add_argument("--cert", required=True,
+                   help="certificate JSON (must already be verified)")
+    st.add_argument("--claim",
+                   help="presented settlement claim JSON to reconcile; "
+                        "omit to build a fresh claim")
+    st.add_argument("--out", help="write the built claim here")
+    st.add_argument("--max-risk", default="low",
+                   help="highest risk level willing to settle "
+                        "(low < medium < high < critical; default low)")
+    st.add_argument("--min-jury-families", type=int, default=2,
+                   help="minimum distinct jury families (§5.2; default 2)")
+    st.add_argument("--min-coverage", type=float, default=1.0,
+                   help="fraction of claims that must be accepted (default 1.0)")
+    st.set_defaults(func=_cmd_settle)
     w = sub.add_parser(
         "watch",
         help="WATCH-mode streaming transport: tail a growing ledger, print "

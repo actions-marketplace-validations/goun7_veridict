@@ -13,6 +13,11 @@ from .utils import payload_digest
 @dataclass(frozen=True)
 class Thresholds:
     min_jury_families: int = 2
+    # This is the field ladder.py actually reads, via
+    # policy.divergence_tolerance on PolicyDeclaration — see the mirror note
+    # there (audit F5). Kept because certs in the wild serialize it under
+    # thresholds, and removing it would break their replay; the single source
+    # of truth at replay time is the declaration field.
     divergence_tolerance: float = 1 / 3
     min_w1_coverage: float = 0.8
     meta_claim_depth_budget: int = 2
@@ -80,9 +85,18 @@ class PolicyEngine:
               declaration: PolicyDeclaration, actor: ActorRef) -> AuditOutcome:
         if declaration.mode not in MODES:
             raise ValueError(f"unknown mode: {declaration.mode}")
+        self._mismatched: list = []
+        # Coverage must count only evidence bound to the artifact the claim is
+        # about (audit F7), or a shared evidence pool inflates coverage from a
+        # repo the claim never touched.
+        def bound_ev(claim: Claim) -> list:
+            ev = evidence_by_claim.get(claim.claim_id, [])
+            if claim.derived_from is None:
+                return ev
+            return [e for e in ev if e.artifact_ref == claim.derived_from]
         mc = [c for c in claims if c.verifiability == "MACHINE_CHECKABLE"]
-        covered = [c for c in mc if any(e.tier in ("W1a", "W1b")
-                                        for e in evidence_by_claim.get(c.claim_id, []))]
+        covered = [c for c in mc
+                   if any(e.tier in ("W1a", "W1b") for e in bound_ev(c))]
         coverage = (len(covered) / len(mc)) if mc else 1.0
         flags: list[str] = []
         # Per-claim verdicts are computed ONCE and reused for the blocking rule;
@@ -90,6 +104,33 @@ class PolicyEngine:
         # full flag set (divergence-split is a first-class flag).
         per_claim = {c.claim_id: self._per_claim(c, evidence_by_claim, declaration)
                      for c in claims}
+        # Evidence that did not belong to the claim's artifact was excluded
+        # before adjudication (F7). Surface it: silent exclusion would hide a
+        # misbound pool behind a verdict computed on less evidence than the
+        # caller believes it had. Advisory everywhere — the verdict itself is
+        # already honest, since the ladder saw only bound evidence.
+        for cid, eid, _ref in self._mismatched:
+            flags.append(f"evidence-artifact-mismatch:{cid}:{eid}")
+        # Audit F8: the §5.2 jury rule (>=2 providers from >=2 families, self
+        # family excluded before the count) is enforced at Jury.__init__, but
+        # nothing at the decision layer inspects the families the *evidence*
+        # was actually produced by. A single-family jury whose W2 SUPPORTS
+        # sustained a claim would then be indistinguishable from a diverse
+        # one in the decision record — the composition requirement would be
+        # an input the verifier cannot check from the artifact.
+        #
+        # The evidence is the ground truth the verifier replays, so count
+        # families there: advisory flag when the W2/W3 producers present are
+        # single-family, so a reader of the decision record cannot mistake a
+        # one-family jury's consensus for the §5.2 requirement. Not blocking
+        # — Jury already raises — but visible, because a cert replayed later
+        # carries evidence, not a Jury object.
+        jury_families = {
+            e.producer.get("family")
+            for ev in evidence_by_claim.values() for e in ev
+            if e.tier in ("W2", "W3") and e.producer.get("family")}
+        if jury_families and len(jury_families) < declaration.thresholds.min_jury_families:
+            flags.append("jury-single-family:" + ",".join(sorted(jury_families)))
         if coverage < declaration.thresholds.min_w1_coverage:
             flags.append("coverage-below-threshold")
         for cid, per in per_claim.items():
@@ -102,15 +143,83 @@ class PolicyEngine:
             if (c.verifiability == "MACHINE_CHECKABLE"
                     and per_claim[c.claim_id]["value"] == "INCONCLUSIVE"):
                 flags.append(f"inconclusive-unresolved:{c.claim_id}")
+        # Criticality match is on NORMALIZED classes (audit F4): the claim's
+        # critical_class and the declaration's criticality come from different
+        # places — the declaration from the operator's policy file, the claim
+        # from ClaimExtractor over the audited AI's intent — so a bare
+        # 'Payments' vs 'payments' vs ' payments ' would silently miss and the
+        # critical claim would be gated by nothing at all. Strip and lower on
+        # both sides; a class that does not match after that is a real
+        # disagreement, not a formatting one, and the operator should see it
+        # in the claim rather than find it absent from the gate.
+        crit = {c.strip().lower() for c in declaration.criticality}
         critical_bad = any(
             per_claim[c.claim_id]["value"] in ("REFUTED", "ESCALATED", "INCONCLUSIVE")
-            for c in claims if c.critical_class in declaration.criticality)
-        # GATE/HYBRID block on ANY refuted claim verdict: a gate that lets a
-        # refuted machine claim through is not a gate (§6 fail-closed).
-        any_refuted = any(per_claim[c.claim_id]["value"] == "REFUTED" for c in claims)
+            for c in claims
+            if (c.critical_class or "").strip().lower() in crit)
+        # Meta-claims are DOCTRINAL coverage questions opened BY the ladder
+        # (R1/R2) exactly when a juror has already dissented. Their evidence
+        # is that same jury round — no W1 truth backs them. Letting a juror's
+        # refusal to answer its own coverage question block the gate would
+        # hand the deciding vote to the dissenter and nullify §5.3 rule 2
+        # (doctrine cannot overturn W1a): the real-LLM canary produced exactly
+        # this — 3B jurors REFUTED every meta-claim with 'the digest provides
+        # no information', and clean code was blocked. They are recorded,
+        # flagged, and shown; they do not block.
+        # Meta-ness is structural, not textual. The ladder produces its own
+        # coverage meta-claims as Adjudication.meta_claims, whose subject is
+        # "coverage-of:{predicate}" of the claim they cover; audit.py then
+        # materializes each as a real DOCTRINAL claim whose predicate is the
+        # subject with ":" -> "-" (ClaimExtractor slugs it). Detecting
+        # meta-ness by testing whether an OPERATOR claim's own *predicate*
+        # starts with "coverage-of-" instead let the audited AI's own intent
+        # wording decide its own blocking status: the predicate comes from
+        # ClaimExtractor._slug(intent_line), so 'DOCTRINE: coverage of payments
+        # is sound' produced predicate 'coverage-of-payments-is-sound', and a
+        # refuted top-level claim then blocked=False — only the advisory flag.
+        # An operator claim is a claim about the artifact, not a meta-claim of
+        # anything; a refuted one must block.
+        #
+        # So: a claim is meta only when the ladder actually recorded a
+        # coverage subject for it — either directly ("coverage-of:{predicate}")
+        # or in the slug form the materialized meta-claim carries. Both the
+        # exclusion from any_refuted and the advisory flag then attach to the
+        # ladder's own meta-claim, never to an operator claim that merely
+        # named itself similarly.
+        meta_subjects = {m["subject"] for c in claims
+                         for m in per_claim[c.claim_id].get("meta_claims", ())}
+        slug_subjects = {s.replace(":", "-") for s in meta_subjects}
+        refuted_meta = [c.claim_id for c in claims
+                        if c.verifiability == "DOCTRINAL"
+                        and (f"coverage-of:{c.predicate}" in meta_subjects
+                             or c.predicate in slug_subjects)
+                        and per_claim[c.claim_id]["value"] == "REFUTED"]
+        for cid in refuted_meta:
+            flags.append(f"meta-coverage-unconfirmed:{cid}")
+        top_level = [c for c in claims
+                     if c.verifiability != "DOCTRINAL"
+                     or (f"coverage-of:{c.predicate}" not in meta_subjects
+                         and c.predicate not in slug_subjects)]
+        # GATE/HYBRID block on ANY refuted TOP-LEVEL claim verdict: a gate that
+        # lets a refuted machine claim through is not a gate (§6 fail-closed).
+        any_refuted = any(per_claim[c.claim_id]["value"] == "REFUTED"
+                          for c in top_level)
+        # A meta-coverage flag is advisory, not a verdict (erratum D15, second
+        # half). It is appended to `flags` above for visibility, but a flag
+        # that blocks IS a verdict — and this one would hand the deciding
+        # vote to the very dissenter §5.3 rule 2 refuses to honor. D15
+        # excluded meta-claims from `any_refuted` yet left them inside
+        # `flags`, and GATE/HYBRID block on any flag at all, so the exclusion
+        # only held in CERTIFICATE mode. Measured: 3/3 clean cases still
+        # blocked under HYBRID with a jury that refutes everything. The
+        # fail-closed surface does not shrink — a refuted TOP-LEVEL claim
+        # still blocks, and critical-class claims still block; only the
+        # juror's refusal to answer its own coverage question stops deciding.
+        blocking_flags = [f for f in flags
+                          if not f.startswith("meta-coverage-unconfirmed:")]
         # decision (§6: separate evidence from decision)
         blocking = (declaration.mode in ("GATE", "HYBRID")
-                    and (critical_bad or any_refuted or flags))
+                    and (critical_bad or any_refuted or blocking_flags))
         blocked = bool(blocking)
         decision_kind = ("gate.blocked" if blocked else
                          "watch.observed" if declaration.mode == "WATCH" else "policy.passed")
@@ -129,8 +238,28 @@ class PolicyEngine:
                             policy_id=declaration.policy_id, policy_digest=digest)
 
     def _per_claim(self, claim: Claim, evidence_by_claim: dict, declaration: PolicyDeclaration) -> dict:
-        """Ladder-driven per-claim verdict (adjudicate duck-types the declaration)."""
+        """Ladder-driven per-claim verdict (adjudicate duck-types the declaration).
+
+        Evidence is bound to the artifact it was produced against. The ladder
+        never inspects artifact_ref/derived_from (audit F7), so without this
+        check evidence from repo Y verifies a claim about repo X wherever the
+        evidence pool is assembled from a shared source or a federated ledger
+        — watcher_stream materializes remote evidence with no artifact check.
+        Excluding the mismatched item is fail-closed: the claim then has less
+        evidence, never more, and a claim left with none lands in the R4
+        fail-safe rather than passing on borrowed proof.
+        """
         ev = evidence_by_claim.get(claim.claim_id, [])
+        if claim.derived_from is not None:
+            bound = []
+            for e in ev:
+                if e.artifact_ref == claim.derived_from:
+                    bound.append(e)
+                else:
+                    self._mismatched.append((claim.claim_id, e.evidence_id,
+                                             e.artifact_ref))
+            ev = bound
         adjudication = adjudicate(claim, ev, declaration)
         return {"value": adjudication.value, "rung": adjudication.rung,
-                "divergence": adjudication.divergence}
+                "divergence": adjudication.divergence,
+                "meta_claims": [dict(m) for m in adjudication.meta_claims]}
