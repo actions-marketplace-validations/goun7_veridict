@@ -20,6 +20,42 @@ role is not *code reviewer* but **risk owner**. Veridict is built around that
 transformation — the machine owns the verdict of intelligence, the human owns
 the verdict of responsibility.
 
+## In 30 seconds
+
+An agent says it did the work — deployed, paid, refactored, passed. "It says
+so" is a **claim**. Veridict turns it into **proof**: a signed certificate
+whose content hash, signature and timestamp **anyone can recompute from the
+file alone** — no ledger, no network, no account, no trust in the auditor.
+
+```bash
+pip install veridict-standard
+
+# an agent issues a signed receipt for completed work
+export VERIDICT_HOME=$PWD/.veridict
+veridict receipt issue --achievement "deployed api v2 to staging" \
+  --actor agent-7 --evidence "gh run 8812 passed"
+
+# the other side verifies it — independently, from the file alone
+veridict verify .veridict/receipts/<cert_id>.json
+# → {"valid": true, "signature_valid": true, "content_hash_valid": true, ...}
+
+# tampering breaks it: one bit in the body breaks the signature,
+# one digit in cert_id breaks the content hash; revocation is an
+# append-only ledger entry, never a rewrite
+```
+
+Two document kinds, one verifier:
+
+- **Receipts** (`veridict receipt`) — signed *proof-of-done* for one
+  achievement: the smallest unit a counterparty actually needs. Exposed to
+  agents over MCP (`mcp/`): `issue` / `verify` / `revoke` / `list`.
+- **Audit certificates** (`veridict audit`) — a full adjudication over a
+  machine-verifiable evidence ladder (tests, static analysis, a blind
+  heterogeneous jury, watchers), replayable offline against the ledger.
+
+Both are append-only, hash-chained, and fail closed: no evidence →
+INCONCLUSIVE, never a clean bill.
+
 ## Why an audit ledger
 
 - **No silent passes.** No evidence → INCONCLUSIVE, flagged — never a clean bill.
@@ -48,6 +84,15 @@ python scripts/dogfood.py
 # ledger + cert ship as release assets: gh release download --latest
 veridict verify --ledger dogfood_ledger.jsonl --cert dogfood_cert.json
 
+# or verify ANY certificate from the file alone — no ledger needed
+# (the cert embeds the signer's public key and a signed timestamp)
+veridict verify dogfood_cert.json
+
+# issue a signed proof-of-done receipt for one achievement, and list them
+export VERIDICT_HOME=$PWD/.veridict
+veridict receipt issue --achievement "cut release v1.1" --actor agent-7
+veridict receipt list
+
 # your own repo, three commands: see "Audit your own repo" below
 
 # regenerate the standard's conformance test vectors (deterministic)
@@ -69,9 +114,10 @@ A failing audit turns it amber or red — worst-verdict-wins.
 
 | Check | Result |
 |---|---|
-| Test suite | 376 passed (both invocation styles, Python 3.12–3.14 in CI) |
+| Test suite | 433 passed, 22 skipped (verified locally; skips are the real-LLM/MCP/soak suites and the two Tamga-parity tests, which skip where the mesh sibling is absent) — both invocation styles, Python 3.12–3.14 in CI |
 | Self-audit | valid certificate, risk `low`, GATE not blocked |
 | Offline replay | `veridict verify` rc 0 on the dogfood certificate |
+| Standalone verification | receipt/cert verified from the **file alone** — content hash + signature + signed timestamp; new suites cover issue/verify/revoke/list, tamper, custody and the MCP protocol surface |
 | Canary (scripted jury) | 23 catches / 3 honest misses / 0 false positives across 26 defect classes — measures a hand-authored refutation table, **not model capability**; labeled as such |
 | Canary (real LLM, lower bound) | **2/25** classes caught, **0 false positives**, by local qwen2.5:3b + llama3.2:3b — the audit's end-to-end catch rate; the earlier 23/25 figure was inflated by a metric bug that counted coverage-meta-claim refusals as findings; sheets in `docs/notes/` |
 | Judgment sonde (model, decoupled from the ladder) | **42/48** correct refutations of defective artifacts by the same 3B jurors (23/24 + 19/24), but **2/4 false refutations on clean code** — the model sees most of the defects; §5.3 rule 2 keeps those refutations from turning a W1a-supported verdict, and the false-refutation rate is the measured justification for that rule |
@@ -178,9 +224,51 @@ composite steps:
           intent: "DOCTRINE: ..."
 ```
 
+## Receipts for agent work (proof-of-done)
+
+An audit certificate is the heavy instrument — evidence ladder, jury,
+watchers. Most of the time a counterparty needs the light one: *did the
+agent do the thing it said it did, and can I check it myself?* That is a
+receipt.
+
+```bash
+export VERIDICT_HOME=$PWD/.veridict     # workspace: ledger + issuer key
+
+# issue: achievement + grounds -> signed, self-contained receipt
+veridict receipt issue --achievement "paid invoice 1042" \
+  --actor agent-pay --evidence "bank confirmation tx 77f3"
+
+# verify standalone (file alone) or fully (with the issuer's ledger)
+veridict verify $PWD/.veridict/receipts/<cert_id>.json
+veridict receipt verify --cert .veridict/receipts/<cert_id>.json \
+  --ledger .veridict/ledger.jsonl
+
+# revoke (append-only: the receipt file is never modified) and list
+veridict receipt revoke --cert .veridict/receipts/<cert_id>.json \
+  --reason "chargeback case 91"
+veridict receipt list --active-only
+```
+
+`veridict verify` dispatches on `certificate_type`: a receipt proves chain
+integrity, issuance and revocation over a ledger, an audit certificate adds
+the claim replay — the top-level command handles both. Revoke accepts the
+receipt file (`--cert`) or a bare `--cert-id`.
+
+Every receipt carries a `content_digest` recomputable from its own fields,
+an Ed25519 signature over the canonical body verified against the public key
+**embedded in the receipt**, and an `issued_at` inside the signed body. The
+issuer's private key stays local (mode 0600, never emitted); only its public
+half ships. Revocation appends a `receipt.revoked` entry to the same
+hash-chained ledger that issued it — the signature stays intact and the
+disavowal stays auditable. See [`mcp/README.md`](mcp/README.md) for the
+agent-facing surface and [`docs/arastirma/`](docs/arastirma/README.md) for
+the academic map of the proof gap this closes.
+
 ## From certificate to settlement
 
 A certificate proves what happened. It does not by itself authorize
+payment — a settlement layer still has to decide whether *this* verified
+work qualifies, and that decision has to fail closed on its own.
 payment — a settlement layer still has to decide whether *this* verified
 work qualifies, and that decision has to fail closed on its own.
 `veridict settle` is that boundary:
@@ -200,6 +288,19 @@ flipping `valid`, or presenting a claim minted against a different
 certificate) is refused. Exit code 0 means the claim holds; non-zero
 means it does not — a pipeline that ignores the report and pays on any rc
 has a bug, and the tool will not help it.
+
+If your workflow keeps a dossier (a machine-readable decision record)
+rather than a bare certificate, `veridict resolve` is the same boundary
+for that shape: it records a human decision on an already-issued dossier
+into the ledger — which dossier, which of the four decisions, who decided,
+and the risk note they accepted under. A resolution for a dossier that was
+never issued is refused, so no human authority can be fabricated.
+
+```bash
+veridict resolve --ledger ledger.jsonl --dossier doss-2026-10 \
+                 --decision accepted --decided-by oncall@example.com \
+                 --note "tutor reviewed the diff"
+```
 
 This is deliberately a **claim generator**, not a payment executor. It
 answers "was provably-done work done", not "should money move". Keeping
@@ -225,6 +326,18 @@ Two ways a Veridict verdict reaches tooling that never heard of us:
   `veridict verify --ledger L --cert C --anchor A` (pinned Rekor key, no
   network, no trust in us). The v1 release's dogfood certificate is anchored
   live — see `docs/receipts-anchor-v1-dogfood.json`.
+- **Mesh-local anchoring** — `veridict audit … --anchor tamga --anchor-ledger
+  mesh.jsonl` pins the *same* checkpoint binding (same `bound_fields`, same
+  digest) into a [Tamga](https://github.com/goun7/tamga-protocol)-grammar
+  hash-chained ledger — the mesh's own permanent proof-anchor layer, no third
+  party and no network at all. Both transports commit to identical bytes, so a
+  relying party can check either surface. The record follows Tamga's chain
+  rules byte-for-byte (`h = sha256(prev + jcs(rec))`, 1-based seq, optional
+  ed25519 node-cosign), which means Tamga's *own* `ledger-verify` accepts a
+  ledger Veridict wrote — verified by a parity test that shells out to Tamga's
+  verifier rather than asserting agreement. `veridict verify … --anchor A`
+  dispatches on the sidecar's `anchor_version`, so both anchors verify through
+  one command.
 - **SLSA export** — `veridict export --format vsa` projects a certificate onto
   a SLSA v1.2 Verification Summary Attestation (in-toto Statement) so existing
   supply-chain policy engines can consume the verdict. The VSA is a lossy
@@ -257,6 +370,9 @@ better one."* — is on [dev.to](https://dev.to/goun7/agents-already-found-their
 - **Design document (founding paper):** [`docs/specs/2026-09-09-veridict-design.md`](docs/specs/2026-09-09-veridict-design.md)
 - **Architecture:** [`ARCHITECTURE.md`](ARCHITECTURE.md) — module map to standard sections
 - **Commercial model:** [`docs/commercial-model.md`](docs/commercial-model.md) — open-core model, growth levers, anti-corruption guardrails
+- **Landing page prep:** [`docs/landing.md`](docs/landing.md) — 30-second pitch, feature map, tiered pricing ($29–99/mo, the core never paywalled)
+- **Academic research:** [`docs/arastirma/README.md`](docs/arastirma/README.md) — the proof gap mapped to six 2025–2026 papers (real links), W3C VC v2.0 / Data Integrity alignment, and the EAS on-chain model
+- **MCP server (receipts):** [`mcp/README.md`](mcp/README.md) — stdio install for Claude Desktop / Cursor / Cline; tools `issue` / `verify` / `revoke` / `list`; registry definition in `mcp/mcp.json`
 - **Contributing / Governance / Security:** [`CONTRIBUTING.md`](CONTRIBUTING.md) · [`GOVERNANCE.md`](GOVERNANCE.md) · [`SECURITY.md`](SECURITY.md)
 - **Building your own verifier** (independent of this codebase, issue #1): [`docs/verifier-onboarding.md`](docs/verifier-onboarding.md) — closure kit: trusted-artifact table, byte-level traps list, one-command parity harness, proofs-as-behavioral-spec
 
@@ -300,4 +416,124 @@ expansion plan is [Roadmap v2 (#10)](https://github.com/goun7/veridict/issues/10
 (launch-hygiene fixes first, then standard maturity, federation, and
 formal verification); the commercial
 model is documented in [`docs/commercial-model.md`](docs/commercial-model.md).
+
+## Akademik zemin (2024-2026)
+
+Delilix tarzı bir not: aşağıdaki her madde, bu README'ye eklenmeden önce HTTP 200
+ile fetch edildi ve başlık+yazar birebir karşılaştırıldı — FP0 (uydurma yok).
+Veridict'in dayandığı alan — DSSE/in-toto tarzı imzalı attestation, yazılım
+tedarik zinciri güvenliği, doğrulanabilir iddialar (verifiable claims), SLSA
+build provenance, ajan harness'in yazdığı kaydın güvenilirliği ve imzalı
+manifest denetimi — üzerine 2024-2026 yayınları. Tüm bağlantılar canlı arXiv
+sayfalarıdır.
+
+- **[1] DSSE İmzalı, Değişmez ve Yeniden Oynatılabilir Ajan Kanıtı** —
+  *NovaFabric: Tamper-Evident, Replayable Evidence for Autonomous AI Agent
+  Runs* — Ardebili, arXiv 2026.
+  Otonom bir ajan çalışmasını, hiçbir ajan mantığını değiştirmeden, DSSE
+  imzası + RFC 3161 zaman damgası + Merkle log ile mühürlü, taşınabilir ve
+  yeniden oynatılabilir bir "Run Capsule" olarak kaydeder. Veridict'in
+  hash-chained ledger + çevrimdışı doğrulanabilir sertifika yaklaşımının
+  aynı ailesinden, doğrudan DSSE uygulaması.
+  [arXiv:2609.12582](https://arxiv.org/abs/2609.12582)
+
+- **[2] Doğrulanabilir Eğitim/Yayın İddiaları için Attestation Geçidi** —
+  *Attesting LLM Pipelines: Enforcing Verifiable Training and Release Claims*
+  — Tan et al., arXiv 2026.
+  Üçüncü parti ağırlıklar, adapter'lar ve dependency'lerden oluşan LLM
+  tedarik zincirinde "data/code lineage, build environment, security
+  scanning" gibi iddiaların kriptografik olarak artifact'e bağlanmamasını
+  bir boşluk olarak tanımlar ve attestation-aware bir promotion gate önerir.
+  Veridict'in "iddia → imzalı, makine-doğrulanabilir kanıt" dönüşümünün
+  ML pipeline genellemesi.
+  [arXiv:2603.28988](https://arxiv.org/abs/2603.28988)
+
+- **[3] CI Hatları için Kanıt Tabanlı Provenance Protokolü** —
+  *An Evidence-driven Protocol for Trustworthy CI Pipelines* — Castillo et
+  al., arXiv 2026.
+  Deterministic Build Systems + Trusted Execution Environments kombinasyonuyla
+  CI artifact'leri için kriptografik doğrulanabilir bütünlük, özgünlük ve
+  attestation garantisi sunar; her tüketicinin build'i yeniden çalıştırmasının
+  doğurduğu doğrulama darboğazını çözer. SLSA build provenance hedefinin
+  kanıt-odaklı bir gerçeklemesi.
+  [arXiv:2605.21089](https://arxiv.org/abs/2605.21089)
+
+- **[4] SLSA/in-toto Ötesinde Otonom Tedarik Zinciri Savunması** —
+  *Agentic AI for Autonomous Defense in Software Supply Chain Security:
+  Beyond Provenance to Vulnerability Mitigation* — Syed et al., arXiv 2025.
+  Mevcut SLSA, SBOM ve in-toto çerçevelerinin provenance ve izlenebilirlik
+  sağladığını ama üretime gömülü zafiyetleri aktif olarak tespit edip
+  gideremediğini belirtir; LLM tabanlı otonom savunmayla tamamlamayı önerir.
+  Veridict'in kanıt katmanının (provenance) ötesine geçiş ihtiyacını
+  tanımlayan referans.
+  [arXiv:2512.23480](https://arxiv.org/abs/2512.23480)
+
+- **[5] Kod Asistanları Provenance Sinyallerini Okuyor mu?** —
+  *Do AI Coding Assistants Check Before They Install? A Pre-Registered
+  Demand-Side Audit of Trust Signals in the Research Software Supply Chain*
+  — Shan, arXiv 2026.
+  SBOM, imzalı release'ler, build provenance attestations ve resmi kanal
+  beyanları gibi makine-okunabilir güven sinyallerinin, paket seçip kuran
+  AI kod asistanları tarafından okunup okunmadığını ölçen önceden
+  kayıtlı bir deney. İmzalı kanıtın üretildiğiyle tüketildiği arasındaki
+  açığı gösterir.
+  [arXiv:2609.07754](https://arxiv.org/abs/2609.07754)
+
+- **[6] LLM Ajanlarında Yürütüm Provenance'ı ve Kanıt İzleme Araştırması** —
+  *From Agent Traces to Trust: A Survey of Evidence Tracing and Execution
+  Provenance in LLM Agents* — Wang et al., arXiv 2026.
+  Ajan izlerini (trace) salt gözlemden, süreç düzeyinde hesap verebilirliğin
+  temeli olarak yürütüm provenance'ına yükseltir: her iddianın arkasındaki
+  kanıt, araç çağrılarının gerekçesi ve belleğin kararlara etkisi. Veridict'in
+  evidence ladder'ının akademik zeminini oluşturur.
+  [arXiv:2606.04990](https://arxiv.org/abs/2606.04990)
+
+- **[7] Skor Değil, İddia Doğrulaması** —
+  *Verify Claims, Not Scores: Evidence-Based Verification of Modular Agents*
+  — Alzahrani, arXiv 2026.
+  Ajanı toplam bir görev skoruyla yargılamak yerine, her sonucu arkasındaki
+  kanıtla birlikte kaydeden ve destekli / desteklenmiyor / çözümlenemedi /
+  değerlendirilmedi olmak üzere dört verdicttan biriyle etiketleyen bir
+  doğrulama denetimi önerir. Veridict'in fail-closed INCONCLUSIVE verdict
+  felsefesiyle aynı özü taşır.
+  [arXiv:2610.01348](https://arxiv.org/abs/2610.01348)
+
+- **[8] Yapısal Ajan Eylemleri için Kaynaklarası Bütünlük Sertifikası** —
+  *Certified Multi-Source Integrity for Structured Agent Actions* — Pandey
+  et al., arXiv 2026.
+  Ajanların ayrıcalıklı, geri alınamaz yapısal eylemlerini (ör. fatura ödeme)
+  bozabilecek belge/araç çıktısı kirlenmesi ve prompt injection'a karşı,
+  bir corruption budget altında eylemin ne zaman güvenle sertifikalanabileceğini
+  tanımlar. Veridict'in imzalı makine-verifier'larıyla aynı "sertifikala,
+  sonra serbest bırak" modeli.
+  [arXiv:2609.34245](https://arxiv.org/abs/2609.34245)
+
+- **[9] Harness'in Yazdığı Kayda Auditor Güvenebilir mi?** —
+  *Hearsay: Can an Auditor Trust the Record a Deployed Agent Harness Writes?* —
+  Dai et al., cs.CR, Eylül 2026.
+  On altı dağıtılmış framework'ün hiçbiri "evidentiary" (orada olmamış bir
+  okuyucunun yazana güvenmeden denetleyebileceği) bir kayıt tam olarak yazmıyor.
+  Makalenin ölçtüğü şey ve Veridict'in tezinin deneysel gerekçesi: bir harness'in
+  **kendi kaydı üstündeki hash chain, harness'in çalışırken işlediği 28
+  omission/fabrication'in hepsini geçirir** (yani sessizce onaylar); buna
+  karşın harness dışında tutulan ve kayıtla her iki yönde okunan bir append-only
+  log aynı 28'inin de hepsini yakalar. Çözüm "ilk yazana daha güçlü bir mühür
+  değil, ikinci bir yazar"dır. Bu, Veridict'in neden hash-chain ile yetinmeyip
+  ikinci yazarlar eklediğidir: watcher manifest'leri, dışsal anchor (Rekor /
+  Tamga) ve standarttan bağımsız yazılmış verifier — hepsi "kanıtın yazarı kim"
+  sorusunun farklı bir yanıtı.
+  [arXiv:2609.32495](https://arxiv.org/abs/2609.32495)
+
+- **[10] MCP Çağrıları için İmzalı Manifest ve Transparency Log** —
+  *Verifiable Manifest Signing and Transparency Enforcement for Secure
+  MCP-Based LLM Pipelines* — Jamshidi et al., cs.CR, Ocak 2026 (v2 Haziran 2026).
+  MCP baseline'ının tool-use manifest'lerini kriptografik olarak doğrulamadığını,
+  tazelik (freshness) denetlemediğini ve bağımsız denetime açmadığını bir boşluk
+  olarak tanımlar; her manifest'i policy-validate + freshness-check + dijital
+  imza + execution öncesi doğrulama + tamper-evident audit evidence'a bağlayan
+  bir uygulama katmanı önerir, kabul edilen çağrıları Merkle transparency log'a
+  yazar ve fail-closed authorization uygular. Veridict'in imzalı watcher
+  manifest'lerinin (registry, §6.6; iptal edilen watcher reddedilir) ve agent'a
+  bakan MCP receipt yüzeyinin (`mcp/`) akademik zeminidir.
+  [arXiv:2601.23132](https://arxiv.org/abs/2601.23132)
 

@@ -14,7 +14,12 @@ jobs:
         with:
           python-version: "3.14"
       - name: Install
-        run: pip install -e . && pip install pytest cryptography pyyaml jsonschema
+        # Fix-2026-10-03 (soak #25): pip install -e . sadece zorunlu bağımlılıkları
+        # kuruyor; mcp opsiyonel. test_runner_does_not_shadow_the_mcp_sdk ve
+        # test_dogfood_* MCP SDK'yı hard-assert ile gerektirir — kurulu değilse
+        # "needs the MCP SDK: pip install mcp" AssertionError ile 3 test kırdı.
+        # mcp artık açıkça kurulur.
+        run: pip install -e . && pip install pytest cryptography pyyaml jsonschema mcp
       - name: Suite
         run: pytest -q
       - name: Tamper soak (5 seeds × 300 mutated ledgers)
@@ -97,6 +102,12 @@ jobs:
                                  identity=it.producer["identity"], version=it.producer["version"]),
                                  it.to_dict())
                   adj = adjudicate(claim, items, pol)
+                  # D19: verifier reconciles policy_ref against the ledger's recorded
+                  # policy — without this the cert names a policy the ledger never
+                  # attested and the reference verifier (correctly) rejects it.
+                  __import__("veridict.policy", fromlist=["PolicyEngine"]).PolicyEngine(
+                      led).apply([claim], {claim.claim_id: items}, pol,
+                                 ActorRef(kind="system", identity="soak", version="1"))
                   cert = CertificateIssuer(led, ks, kid).issue(
                       task=task, artifact_digest=f"art-{i}", policy=pol, claims=[claim],
                       adjudications=[adj], evidence_by_claim={claim.claim_id: items},
