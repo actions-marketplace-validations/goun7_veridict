@@ -43,7 +43,7 @@ jobs:
   ladder-proofs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       - name: Install elan (toolchain pinned by proofs/*/lean-toolchain)
         run: |
           curl -sSf https://elan.lean-lang.org/elan-init.sh | sh -s -- -y --default-toolchain none
