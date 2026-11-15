@@ -55,7 +55,7 @@ inputs:
 runs:
   using: 'composite'
   steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@v7.0.1
       with:
         path: auditee
 
