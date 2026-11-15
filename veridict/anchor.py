@@ -184,6 +184,13 @@ def verify(sidecar: dict, cert: dict | None = None, *,
     commitment to `sidecar.digest`, without claiming what it binds.
     """
     errors: list[str] = []
+    # VERIDICT-ANC-1: sidecar bir dict DEĞILSE ( None/metin/liste) eski kod
+    # AttributeError ile çöküyordu — verify sözleşmesi fail-closed'dir:
+    # her hata-ekleyip geçersiz-kılan tek bir转为 exit VERIR.
+    if not isinstance(sidecar, dict):
+        return {"valid": False,
+                "errors": [f"sidecar must be a dict, got {type(sidecar).__name__}"],
+                "summary": {}}
     r = (sidecar.get("rekor") or {})
     entry = r.get("entry") or {}
     bound = sidecar.get("bound") or {}
@@ -229,13 +236,26 @@ def verify(sidecar: dict, cert: dict | None = None, *,
     try:
         root_from_note = base64.b64decode(root_b64).hex()
     except Exception:
+        # VERIDICT-ANC-1: sessiz-geçiş ( root_from_note="" → kontrol-atlanır)
+        # fail-open idi — geçersiz kök artık doğrudan hata.
+        errors.append("checkpoint root is not valid base64")
         root_from_note = ""
     if root_from_note and root_from_note != proof.get("rootHash"):
         errors.append("proof rootHash disagrees with the signed checkpoint")
-    if tree_size.isdigit() and int(tree_size) <= int(proof.get("logIndex", -1)):
+    # VERIDICT-ANC-1: tree_size rakam-DEĞİLSE sessizce-atlanıyordu — artık hata.
+    if not tree_size.isdigit():
+        errors.append("checkpoint tree_size is not a decimal number")
+    elif int(tree_size) <= int(proof.get("logIndex", -1)):
         errors.append("proof logIndex is not inside the signed tree")
 
-    # 2) UUID structure: treeID || leaf || treeID (live-log convention)
+    # 2) UUID structure: treeID || leaf || treeID (live-log convention).
+    # ANCORECT: 96-uzunluk-zorunlulugu GERI-ALINDI. fail-closed-sozlesmesi
+    # yalnizca TAM-96-formatindaki-uuid'nin-leaf'i-tutmazsa-ateslenir
+    # (base-sema); bilinmeyen-uzunlukta-yapisal-iddiada-bulunulmaz — veri-
+    # fikasyon-setimizdeki-kayitli-probe'lar 84-hex'tir (test_anchor.py'de
+    # PROBE_UUID) ve 96-zorunlulugu-o-probe'u-gecersiz-sayip-canli-probe-
+    # pinini-kiriyordu (dogfood-full-suite-PoE-ile-yakalandi). NARROW-
+    # 'manifest-preserving verifier'-kapsami (modul-basi) korunmustir.
     uuid = r.get("uuid", "")
     leaf_hex = leaf_hash(body).hex()
     if len(uuid) == 96 and uuid[16:80] != leaf_hex:
